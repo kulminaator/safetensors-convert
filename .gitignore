@@ -1,0 +1,17 @@
+# Model weights / large input data — never commit (see GUIDELINES.md)
+inputs/Qwen*
+
+# Build artifacts
+/stconv
+/safetensors-convert
+
+# Editor swap files
+*.swp
+
+
+## output test dir
+out/
+
+
+## acme manager
+.acme-manager/

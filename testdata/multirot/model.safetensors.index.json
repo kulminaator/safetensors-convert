@@ -1,0 +1,9 @@
+{
+  "metadata": {
+    "total_size": 1024
+  },
+  "weight_map": {
+    "rot.a": "model.safetensors-00001-of-00002.safetensors",
+    "rot.b": "model.safetensors-00002-of-00002.safetensors"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "metadata": {
+    "total_size": 48
+  },
+  "weight_map": {
+    "model.layers.0.mlp.up_proj.weight": "model.safetensors-00001-of-00002.safetensors",
+    "model.layers.0.self_attn.q_proj.weight": "model.safetensors-00001-of-00002.safetensors",
+    "model.layers.0.input_layernorm.weight": "model.safetensors-00002-of-00002.safetensors",
+    "model.layers.0.mlp.position_ids": "model.safetensors-00002-of-00002.safetensors"
+  }
+}
