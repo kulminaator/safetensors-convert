@@ -604,6 +604,37 @@ func TestConvertSingleExplicitRuleOverridesProtection(t *testing.T) {
 	})
 }
 
+// TestConvertSingleNoProtectRestoresBlanketConversion pins the
+// -no-protect behavior at the library level: with Protect explicitly
+// false, even protected tensors (the norm weight, the attention
+// projection) convert to the target dtype - the pre-policy behavior.
+func TestConvertSingleNoProtectRestoresBlanketConversion(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "out.safetensors")
+	stats, err := ConvertFile(ConvertOptions{
+		InputPath:  singleFixturePath,
+		OutputPath: out,
+		Default:    TargetFP8E4M3,
+		Protect:    false,
+	})
+	if err != nil {
+		t.Fatalf("ConvertFile: %v", err)
+	}
+	if len(stats) != 3 {
+		t.Fatalf("got %d stats, want 3", len(stats))
+	}
+	for _, s := range stats {
+		if s.ToDType != DTypeF8E4M3 {
+			t.Errorf("stat (%s).ToDType = %s, want F8_E4M3 (protection off converts everything)", s.Name, s.ToDType)
+		}
+		if s.SkippedWhy != "" {
+			t.Errorf("stat (%s).SkippedWhy = %q, want converted", s.Name, s.SkippedWhy)
+		}
+		if s.ProtectOverride {
+			t.Errorf("stat (%s).ProtectOverride = true, want false (no config rules in this run)", s.Name)
+		}
+	}
+}
+
 func TestPlanModelInt8ScaleFollowsOwner(t *testing.T) {
 	cfg := &Config{
 		Rules: []ConfigRule{{Match: nameNorm, DType: "int8"}},

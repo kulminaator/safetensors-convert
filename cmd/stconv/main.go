@@ -53,6 +53,7 @@ func run() error {
 	targetStr := flag.String("target", "fp8_e4m3", "default conversion target for tensors not covered by -config: fp8_e4m3, fp8_e5m2, int8, int8_convrot, mxfp4, nvfp4, int4, or none")
 	minElems := flag.Int("min-elems", 0, "skip conversion for tensors with fewer elements than this (e.g. to leave small bias/norm vectors alone)")
 	chunkElems := flag.Int("chunk-elems", stconv.DefaultChunkElems, "elements processed per streaming chunk; bounds peak memory regardless of tensor/file size")
+	noProtect := flag.Bool("no-protect", false, "disable the built-in default precision policy and convert every tensor to the target dtype; by default, protected tensors (norm weights, token embeddings, the output head, and attention projections for fp8 targets) are kept at their original precision - see quantization-advice.md")
 	quiet := flag.Bool("quiet", false, "suppress per-tensor report")
 	flag.Parse()
 
@@ -89,6 +90,7 @@ func run() error {
 		InputIndex:  inIndex,
 		Config:      cfg,
 		Default:     target,
+		Protect:     !*noProtect,
 		MinElems:    *minElems,
 		ChunkElems:  *chunkElems,
 	}
