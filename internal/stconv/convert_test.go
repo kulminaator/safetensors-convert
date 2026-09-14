@@ -189,6 +189,127 @@ func TestPlanModelTargetsAcrossShards(t *testing.T) {
 	})
 }
 
+// singleFixturePath is the committed 1-file gen fixture (testdata/gen's
+// single mode): up_proj (BF16 [2,4], 8 elems), q_proj (F16 [2,2]), norm
+// (F16 [4]).
+const singleFixturePath = "../../testdata/single/single.safetensors"
+
+// TestConvertSingleFP8DefaultProtection runs the single fixture through
+// ConvertFile with the default fp8 target and protection enabled (no
+// config): the norm weight is kept at its original dtype with the
+// protection reason in the report, the attention projection is kept (the
+// fp8 rule), and the plain MLP projection still converts to fp8.
+func TestConvertSingleFP8DefaultProtection(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "out.safetensors")
+	stats, err := ConvertFile(ConvertOptions{
+		InputPath:  singleFixturePath,
+		OutputPath: out,
+		Default:    TargetFP8E4M3,
+		Protect:    true,
+	})
+	if err != nil {
+		t.Fatalf("ConvertFile: %v", err)
+	}
+	if len(stats) != 3 {
+		t.Fatalf("got %d stats, want 3", len(stats))
+	}
+
+	want := []struct {
+		name       string
+		toDType    DType
+		skippedWhy string
+	}{
+		{nameUpProj, DTypeF8E4M3, ""},
+		{nameQProj, DTypeF16, protectReasonAttnProj},
+		{nameNorm, DTypeF16, protectReasonNorms},
+	}
+	for i, w := range want {
+		s := stats[i]
+		if s.Name != w.name {
+			t.Fatalf("stat[%d].Name = %q, want %q", i, s.Name, w.name)
+		}
+		if s.ToDType != w.toDType {
+			t.Errorf("stat (%s).ToDType = %s, want %s", s.Name, s.ToDType, w.toDType)
+		}
+		if s.SkippedWhy != w.skippedWhy {
+			t.Errorf("stat (%s).SkippedWhy = %q, want %q", s.Name, s.SkippedWhy, w.skippedWhy)
+		}
+	}
+
+	// The protected tensors are passthrough: output dtype equals input
+	// dtype (without protection the norm would be F8_E4M3).
+	for _, s := range stats[1:] {
+		if s.ToDType != s.FromDType {
+			t.Errorf("stat (%s): protected tensor converted %s -> %s, want passthrough", s.Name, s.FromDType, s.ToDType)
+		}
+	}
+}
+
+// TestPlanTensorProtectionOrdering pins that protection is decided before
+// the mechanical passthrough checks: with MinElems high enough to skip
+// every tensor in the single fixture, the protected tensors still report
+// their policy reason while the unprotected one reports the mechanical
+// one. A config default (not a rule) is a bulk default, so protection
+// applies to it too. Zero-value options (Protect unset) keep the
+// pre-policy blanket-conversion behavior.
+func TestPlanTensorProtectionOrdering(t *testing.T) {
+	t.Run("policy reason wins over min-elems", func(t *testing.T) {
+		plans, _, err := planModel(ConvertOptions{
+			InputShards: []string{singleFixturePath},
+			Default:     TargetFP8E4M3,
+			Protect:     true,
+			MinElems:    100, // all three fixture tensors are smaller
+		})
+		if err != nil {
+			t.Fatalf("planModel: %v", err)
+		}
+		wantSkip := map[string]string{
+			nameUpProj: "fewer than 100 elements", // not protected
+			nameQProj:  protectReasonAttnProj,     // fp8 rule
+			nameNorm:   protectReasonNorms,        // hard rule
+		}
+		for _, p := range plans {
+			if p.skippedWhy != wantSkip[p.name] {
+				t.Errorf("plan (%s).skippedWhy = %q, want %q", p.name, p.skippedWhy, wantSkip[p.name])
+			}
+		}
+	})
+
+	t.Run("config default is not explicit, protection applies", func(t *testing.T) {
+		plans, _, err := planModel(ConvertOptions{
+			InputShards: []string{singleFixturePath},
+			Config:      &Config{Default: "fp8_e4m3"},
+			Protect:     true,
+		})
+		if err != nil {
+			t.Fatalf("planModel: %v", err)
+		}
+		for _, p := range plans {
+			if p.name == nameNorm && p.skippedWhy != protectReasonNorms {
+				t.Errorf("plan (%s).skippedWhy = %q, want the protection reason (config default is not explicit intent)", p.name, p.skippedWhy)
+			}
+			if p.name == nameUpProj && p.skippedWhy != "" {
+				t.Errorf("plan (%s).skippedWhy = %q, want converted", p.name, p.skippedWhy)
+			}
+		}
+	})
+
+	t.Run("zero-value options keep the old behavior", func(t *testing.T) {
+		plans, _, err := planModel(ConvertOptions{
+			InputShards: []string{singleFixturePath},
+			Default:     TargetFP8E4M3,
+		})
+		if err != nil {
+			t.Fatalf("planModel (no protect): %v", err)
+		}
+		for _, p := range plans {
+			if p.skippedWhy != "" {
+				t.Errorf("plan (%s).skippedWhy = %q, want converted (protection off)", p.name, p.skippedWhy)
+			}
+		}
+	})
+}
+
 func TestPlanModelInt8ScaleFollowsOwner(t *testing.T) {
 	cfg := &Config{
 		Rules: []ConfigRule{{Match: nameNorm, DType: "int8"}},

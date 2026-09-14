@@ -31,6 +31,7 @@ type ConvertOptions struct {
 	OutputDir   string     // multi-file output directory (mutually exclusive with OutputPath)
 	Config      *Config    // may be nil
 	Default     TargetKind // used when Config is nil, or Config has no default and no rule matches
+	Protect     bool       // apply the built-in default precision policy (protect.go); the CLI sets this explicitly per run
 	MinElems    int        // tensors with fewer elements than this are never converted (0 disables)
 	ChunkElems  int        // 0 -> DefaultChunkElems
 }
@@ -53,19 +54,20 @@ type TensorStat struct {
 // up front, which is what lets us write the header once and then stream
 // data straight through in file order.
 type tensorPlan struct {
-	name         string
-	srcShard     int               // index into ConvertOptions.InputShards; srcAbsOffset is relative to that shard file
-	srcName      string            // input shard filename (basename); multi-file output keeps it as the output shard name
-	srcMetadata  map[string]string // input shard's __metadata__ block (nil if none); shared by all plans from that shard
-	srcInfo      TensorInfo
-	srcAbsOffset int64 // absolute offset of source tensor bytes in its source shard file
-	srcLen       int64 // source tensor byte length
-	numElems     int64
-	target       TargetKind
-	outDType     DType
-	outLen       int64  // planned output byte length of this tensor (sibling tensors not included)
-	skippedWhy   string // non-empty => passthrough copy, no conversion
-	sibs         []sib  // sibling tensors this plan emits (nil for passthrough)
+	name          string
+	srcShard      int               // index into ConvertOptions.InputShards; srcAbsOffset is relative to that shard file
+	srcName       string            // input shard filename (basename); multi-file output keeps it as the output shard name
+	srcMetadata   map[string]string // input shard's __metadata__ block (nil if none); shared by all plans from that shard
+	srcInfo       TensorInfo
+	srcAbsOffset  int64 // absolute offset of source tensor bytes in its source shard file
+	srcLen        int64 // source tensor byte length
+	numElems      int64
+	target        TargetKind
+	outDType      DType
+	outLen        int64  // planned output byte length of this tensor (sibling tensors not included)
+	protectReason string // non-empty => the passthrough came from the default protection policy, not from config/default or a mechanical constraint
+	skippedWhy    string // non-empty => passthrough copy, no conversion
+	sibs          []sib  // sibling tensors this plan emits (nil for passthrough)
 }
 
 // sib is one sibling tensor emitted alongside a converted tensor's owner.
@@ -419,9 +421,25 @@ func planTensor(opts ConvertOptions, name string, info TensorInfo, srcShard int,
 		info.DType == DTypeF32 || info.DType == DTypeF64
 
 	target := opts.Default
+	explicit := false
 	if opts.Config != nil {
-		// The explicit-match flag is consumed by the protection policy (see protect.go).
-		target, _ = opts.Config.TargetFor(name, opts.Default)
+		target, explicit = opts.Config.TargetFor(name, opts.Default)
+	}
+
+	// The default protection policy (protect.go) keeps precision-sensitive
+	// tensors at their original dtype. It is a default, not a lock: an
+	// explicit config rule (matched above) is per-tensor user intent and
+	// wins, while the config default and the CLI -target are bulk defaults
+	// the policy applies to. Protection is decided before the mechanical
+	// passthrough checks below (MinElems, the convrot 256-multiple rule):
+	// all three produce passthrough, so the only consequence of the order
+	// is which reason string is reported - a policy decision takes
+	// precedence over a mechanical constraint.
+	if opts.Protect && !explicit {
+		if protect, reason := ProtectDefault(name, target); protect {
+			target = TargetNone
+			plan.protectReason = reason
+		}
 	}
 
 	switch {
@@ -430,7 +448,11 @@ func planTensor(opts ConvertOptions, name string, info TensorInfo, srcShard int,
 		plan.skippedWhy = "non-float dtype, copied as-is"
 	case target == TargetNone:
 		plan.outDType = info.DType
-		plan.skippedWhy = "config/default says keep original"
+		if plan.protectReason != "" {
+			plan.skippedWhy = plan.protectReason
+		} else {
+			plan.skippedWhy = "config/default says keep original"
+		}
 	case opts.MinElems > 0 && numElems < int64(opts.MinElems):
 		plan.outDType = info.DType
 		plan.skippedWhy = fmt.Sprintf("fewer than %d elements", opts.MinElems)
