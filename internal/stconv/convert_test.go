@@ -310,6 +310,144 @@ func TestPlanTensorProtectionOrdering(t *testing.T) {
 	})
 }
 
+// TestConvertSingleAttnProjFP8OnlyProtection pins that the attention
+// projection protection is fp8-only: the single fixture's q_proj is kept
+// at its original dtype with the scaling rationale for fp8_e4m3 and
+// fp8_e5m2, but converts as an ordinary weight (correct output dtype and
+// scale siblings) for the scaled targets int8, mxfp4, nvfp4, and int4 -
+// protection must not over-reach to formats that carry a scale.
+func TestConvertSingleAttnProjFP8OnlyProtection(t *testing.T) {
+	cases := []struct {
+		name   string
+		target TargetKind
+		header []outEntry // full expected output header
+		qSkip  string     // q_proj's report skip reason; empty => converted
+	}{
+		{
+			"fp8_e4m3", TargetFP8E4M3,
+			[]outEntry{
+				{nameUpProj, DTypeF8E4M3, [2]int64{0, 8}},
+				{nameQProj, DTypeF16, [2]int64{8, 16}}, // protected: passthrough at F16
+				{nameNorm, DTypeF16, [2]int64{16, 24}},
+			},
+			protectReasonAttnProj,
+		},
+		{
+			"fp8_e5m2", TargetFP8E5M2,
+			[]outEntry{
+				{nameUpProj, DTypeF8E5M2, [2]int64{0, 8}},
+				{nameQProj, DTypeF16, [2]int64{8, 16}}, // protected: passthrough at F16
+				{nameNorm, DTypeF16, [2]int64{16, 24}},
+			},
+			protectReasonAttnProj,
+		},
+		{
+			"int8", TargetInt8,
+			[]outEntry{
+				{nameUpProj, DTypeI8, [2]int64{0, 8}},
+				{nameUpProj + ".scale", DTypeF32, [2]int64{8, 12}},
+				{nameQProj, DTypeI8, [2]int64{12, 16}}, // converted: scaled target
+				{nameQProj + ".scale", DTypeF32, [2]int64{16, 20}},
+				{nameNorm, DTypeF16, [2]int64{20, 28}},
+			},
+			"",
+		},
+		{
+			"mxfp4", TargetMxFP4,
+			[]outEntry{
+				{nameUpProj + ".block_scale", DTypeU8, [2]int64{0, 1}},
+				{nameUpProj, DTypeU8, [2]int64{1, 5}},
+				{nameQProj + ".block_scale", DTypeU8, [2]int64{5, 6}}, // converted: scaled target
+				{nameQProj, DTypeU8, [2]int64{6, 8}},
+				{nameNorm, DTypeF16, [2]int64{8, 16}},
+			},
+			"",
+		},
+		{
+			"nvfp4", TargetNVFP4,
+			[]outEntry{
+				{nameUpProj + ".global_scale", DTypeF32, [2]int64{0, 4}},
+				{nameUpProj + ".block_scale", DTypeF8E4M3, [2]int64{4, 5}},
+				{nameUpProj, DTypeU8, [2]int64{5, 9}},
+				{nameQProj + ".global_scale", DTypeF32, [2]int64{9, 13}}, // converted: scaled target
+				{nameQProj + ".block_scale", DTypeF8E4M3, [2]int64{13, 14}},
+				{nameQProj, DTypeU8, [2]int64{14, 16}},
+				{nameNorm, DTypeF16, [2]int64{16, 24}},
+			},
+			"",
+		},
+		{
+			"int4", TargetInt4,
+			[]outEntry{
+				{nameUpProj, DTypeU8, [2]int64{0, 4}},
+				{nameUpProj + ".scale", DTypeF32, [2]int64{4, 8}},
+				{nameQProj, DTypeU8, [2]int64{8, 10}}, // converted: scaled target
+				{nameQProj + ".scale", DTypeF32, [2]int64{10, 14}},
+				{nameNorm, DTypeF16, [2]int64{14, 22}},
+			},
+			"",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := filepath.Join(t.TempDir(), "out.safetensors")
+			stats, err := ConvertFile(ConvertOptions{
+				InputPath:  singleFixturePath,
+				OutputPath: out,
+				Default:    tc.target,
+				Protect:    true,
+			})
+			if err != nil {
+				t.Fatalf("ConvertFile: %v", err)
+			}
+
+			f, err := os.Open(out)
+			if err != nil {
+				t.Fatalf("opening output: %v", err)
+			}
+			defer f.Close()
+			outHeader, dataStart, err := ReadHeader(f)
+			if err != nil {
+				t.Fatalf("reading output header: %v", err)
+			}
+			checkOutHeader(t, outHeader, tc.header)
+
+			var q *TensorStat
+			for i := range stats {
+				if stats[i].Name == nameQProj {
+					q = &stats[i]
+				}
+			}
+			if q == nil {
+				t.Fatalf("no stat for %s", nameQProj)
+			}
+			if q.SkippedWhy != tc.qSkip {
+				t.Errorf("stat (%s).SkippedWhy = %q, want %q", nameQProj, q.SkippedWhy, tc.qSkip)
+			}
+			if tc.qSkip != "" && q.ToDType != q.FromDType {
+				t.Errorf("stat (%s): protected tensor converted %s -> %s, want passthrough", nameQProj, q.FromDType, q.ToDType)
+			}
+
+			if tc.target == TargetInt8 {
+				// The converted q_proj carries a real scale: fixture values
+				// 2.0, -2.0, 0.5, -0.5 -> maxAbs 2.0 -> scale 2.0/127.
+				for _, e := range outHeader.Tensors {
+					if e.Name != nameQProj+".scale" {
+						continue
+					}
+					b := make([]byte, 4)
+					if _, err := f.ReadAt(b, dataStart+e.Info.DataOffsets[0]); err != nil {
+						t.Fatalf("reading q_proj scale: %v", err)
+					}
+					if got := math.Float32frombits(binary.LittleEndian.Uint32(b)); got != 2.0/127 {
+						t.Errorf("q_proj int8 scale = %v, want %v", got, 2.0/127)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestPlanModelInt8ScaleFollowsOwner(t *testing.T) {
 	cfg := &Config{
 		Rules: []ConfigRule{{Match: nameNorm, DType: "int8"}},
