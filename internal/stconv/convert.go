@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 )
 
 // DefaultChunkElems bounds how many source elements are held in memory at
@@ -166,6 +167,11 @@ func ConvertFile(opts ConvertOptions) ([]TensorStat, error) {
 // tensorPlan.srcShard). Tensor data is streamed in bounded chunks in both
 // directions - nothing near the size of the full model is ever held in
 // memory at once.
+//
+// A failure after the output files are created closes and removes the
+// partially written outputs (the single file, or every output shard plus
+// the index if it was written), so a failed run leaves nothing loadable
+// behind; input files are never touched.
 func ConvertModel(opts ConvertOptions) ([]TensorStat, error) {
 	if len(opts.InputShards) == 0 {
 		return nil, fmt.Errorf("no input shards given")
@@ -207,7 +213,19 @@ func ConvertModel(opts ConvertOptions) ([]TensorStat, error) {
 	if err != nil {
 		return nil, fmt.Errorf("creating output: %w", err)
 	}
-	defer out.Close()
+	// A failed run must not leave a partial output file behind: on any
+	// error after this point, close the file and remove it. success is set
+	// only on the final return, so every error path cleans up.
+	success := false
+	defer func() {
+		// Close before remove: the file must be closed before it can be
+		// unlinked, and on the failure path the close error is not what
+		// matters - the run's error is.
+		out.Close()
+		if !success {
+			os.Remove(opts.OutputPath)
+		}
+	}()
 
 	bw := bufio.NewWriterSize(out, 4<<20) // 4MB write buffer, independent of chunkElems
 
@@ -232,7 +250,28 @@ func ConvertModel(opts ConvertOptions) ([]TensorStat, error) {
 		return nil, fmt.Errorf("flushing output: %w", err)
 	}
 
+	success = true
 	return stats, nil
+}
+
+// ensureNoOverwrite stats every planned multi-file output path (all
+// output shards plus the index) and refuses the run if any already
+// exists, matching the single-file never-overwrite policy that
+// ResolveOutput enforces on -out. Every target is checked up front, before
+// any file is created, so a refused run touches nothing in the output
+// directory and keeps the fail-before-creating-any-output property the
+// input-open ordering already has.
+func ensureNoOverwrite(paths ...string) error {
+	for _, path := range paths {
+		_, err := os.Stat(path)
+		if err == nil {
+			return fmt.Errorf("refusing to overwrite existing output file %s", path)
+		}
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("checking output path %s: %w", path, err)
+		}
+	}
+	return nil
 }
 
 // convertModelToShards is the multi-file output branch of ConvertModel:
@@ -243,9 +282,29 @@ func ConvertModel(opts ConvertOptions) ([]TensorStat, error) {
 // single-file pass - nothing here buffers beyond the per-shard write
 // buffers, and the open fd count is bounded by the shard count on both
 // the input and the output side.
+//
+// Planned output shard and index paths that already exist are refused up
+// front, before any file is created: the tool never overwrites in place,
+// the same policy the single-file branch gets from ResolveOutput.
+//
+// Any error after the shard files are created (streaming, flush, or index
+// write) closes and removes every created output shard and, if it was
+// written, the index, so a failed run leaves nothing loadable behind.
 func convertModelToShards(opts ConvertOptions, plans []tensorPlan, sources []string, chunkElems int) ([]TensorStat, error) {
 	shardOuts, outIndex, err := PlanShardOutput(plans, opts.InputIndex, opts.OutputDir)
 	if err != nil {
+		return nil, err
+	}
+
+	// The tool never overwrites in place: refuse any planned output shard
+	// or index path that already exists, before creating anything (the
+	// single-file branch gets the same guarantee from ResolveOutput).
+	outPaths := make([]string, 0, len(shardOuts)+1)
+	for _, sh := range shardOuts {
+		outPaths = append(outPaths, filepath.Join(opts.OutputDir, sh.Name))
+	}
+	outPaths = append(outPaths, outIndex.Path)
+	if err := ensureNoOverwrite(outPaths...); err != nil {
 		return nil, err
 	}
 
@@ -257,17 +316,35 @@ func convertModelToShards(opts ConvertOptions, plans []tensorPlan, sources []str
 	defer closeFiles(shards)
 
 	// One output file per shard, each with its complete header written
-	// once, up front, before any data.
+	// once, up front, before any data. A failed run must not leave
+	// partial shards - or an index pointing at them - behind: on any
+	// error after this point, close and remove every created output file
+	// (and the index, if it was written). success is set only on the final
+	// return, so every error path cleans up.
 	outFiles := make([]*os.File, len(shardOuts))
+	success := false
+	defer func() {
+		// Close before remove: a file must be closed before it can be
+		// unlinked, and on the failure path the close/remove errors are
+		// not what matters - the run's first error is. Removing the index
+		// is a no-op if it was never written.
+		closeFiles(outFiles)
+		if !success {
+			for i, f := range outFiles {
+				if f != nil {
+					os.Remove(filepath.Join(opts.OutputDir, shardOuts[i].Name))
+				}
+			}
+			os.Remove(outIndex.Path)
+		}
+	}()
 	for i, sh := range shardOuts {
 		f, err := CreateOutputFile(filepath.Join(opts.OutputDir, sh.Name), sh.Header)
 		if err != nil {
-			closeFiles(outFiles[:i])
 			return nil, fmt.Errorf("creating output shard %q: %w", sh.Name, err)
 		}
 		outFiles[i] = f
 	}
-	defer closeFiles(outFiles)
 
 	// Each plan writes to the output shard mirroring its input shard. Plans
 	// are in shard order, so first appearance of srcShard matches
@@ -316,6 +393,7 @@ func convertModelToShards(opts ConvertOptions, plans []tensorPlan, sources []str
 		return nil, fmt.Errorf("writing output index %s: %w", outIndex.Path, err)
 	}
 
+	success = true
 	return stats, nil
 }
 
@@ -352,13 +430,25 @@ func closeFiles(fs []*os.File) {
 // output offsets accumulating globally across shards.
 func planModel(opts ConvertOptions) ([]tensorPlan, *Header, error) {
 	outHeader := &Header{}
-	plans := make([]tensorPlan, 0, 8)
+	plans := make([]tensorPlan, 0)
+	// The merged output is one header, so tensor names must be unique
+	// across the whole planning loop, not just within each shard: a model
+	// directory without an index (the glob fallback) or a hand-assembled
+	// shard set can carry the same name twice, and both entries would
+	// otherwise land in the output header as duplicate JSON keys - an
+	// invalid safetensors file with no diagnostic.
+	seen := make(map[string]bool)
 
 	for srcShard, path := range opts.InputShards {
 		header, dataStart, err := readShardHeader(path)
 		if err != nil {
 			return nil, nil, err
 		}
+
+		// The header is known here, so grow plans to exactly this shard's
+		// tensor count instead of letting append re-allocate as it doubles.
+		// Still O(total tensor count) memory.
+		plans = slices.Grow(plans, len(header.Tensors))
 
 		if srcShard == 0 {
 			// The merged output keeps the first shard's __metadata__ block;
@@ -368,6 +458,10 @@ func planModel(opts ConvertOptions) ([]tensorPlan, *Header, error) {
 
 		base := filepath.Base(path)
 		for _, entry := range header.Tensors {
+			if seen[entry.Name] {
+				return nil, nil, fmt.Errorf("duplicate tensor name %q (in shard %q and earlier)", entry.Name, path)
+			}
+			seen[entry.Name] = true
 			plan, err := planTensor(opts, entry.Name, entry.Info, srcShard, dataStart, outHeader)
 			if err != nil {
 				return nil, nil, err
@@ -421,6 +515,15 @@ func planTensor(opts ConvertOptions, name string, info TensorInfo, srcShard int,
 	if plan.srcLen < 0 {
 		return plan, fmt.Errorf("tensor %q: invalid data_offsets %v", name, info.DataOffsets)
 	}
+	// A negative dimension makes numElems negative, which would silently
+	// no-op the streaming loops (their done < numElems bounds never run)
+	// and plan a negative output length. Reject the header instead of
+	// trusting it.
+	for _, d := range info.Shape {
+		if d < 0 {
+			return plan, fmt.Errorf("tensor %q: negative dimension %d in shape %v", name, d, info.Shape)
+		}
+	}
 
 	convertible := info.DType == DTypeF16 || info.DType == DTypeBF16 ||
 		info.DType == DTypeF32 || info.DType == DTypeF64
@@ -467,6 +570,22 @@ func planTensor(opts ConvertOptions, name string, info TensorInfo, srcShard int,
 		plan.skippedWhy = "not a multiple of 256 (rotation group size)"
 	default:
 		plan.target = target
+		// A converting tensor is read with numElems × srcElemSize bytes at
+		// srcAbsOffset, so the header's data_offsets must agree with
+		// shape × dtype. A mismatch would either read a neighboring
+		// tensor's bytes silently or fail later with an opaque ReadAt error
+		// after the outputs were already created. The check is
+		// converting-path-only: the passthrough paths deliberately skip it
+		// - see the srcLen-copy comment below for why.
+		srcElemSize, err := info.DType.ByteSize()
+		if err != nil {
+			return plan, err
+		}
+		wantLen := numElems * int64(srcElemSize)
+		if plan.srcLen != wantLen {
+			return plan, fmt.Errorf("tensor %q: data_offsets span %d bytes, but shape %v of %s is %d elems x %d bytes = %d bytes",
+				name, plan.srcLen, info.Shape, info.DType, numElems, srcElemSize, wantLen)
+		}
 		// An explicit rule converting a protected tensor wins over the
 		// policy (quantization-advice.md: honor the request, but warn).
 		// Only tensors actually converted are flagged - a rule that keeps
@@ -503,6 +622,13 @@ func planTensor(opts ConvertOptions, name string, info TensorInfo, srcShard int,
 	// stored, so srcLen is what keeps the re-emitted data_offsets
 	// consistent with the data actually written (a -target none round-trip
 	// of such an output stays byte-identical).
+	//
+	// That is exactly why the shape/offset byte-agreement check above
+	// (srcLen == numElems × srcElemSize) is converting-path-only and is
+	// NOT applied here: a passthrough must not be rejected for the
+	// packed-4-bit case, where srcLen is deliberately half of
+	// numElems × srcElemSize. Such a tensor's dtype is U8, which is
+	// non-convertible anyway, so it always lands on this path.
 	if plan.skippedWhy != "" {
 		plan.outLen = plan.srcLen
 	}
@@ -523,24 +649,58 @@ func planTensor(opts ConvertOptions, name string, info TensorInfo, srcShard int,
 	return plan, nil
 }
 
+// countingWriter wraps an io.Writer and counts the bytes written through
+// it. convertTensor uses one per tensor (O(1) state) to enforce the
+// plan/stream invariant in checkWritten: the plan-then-stream design has
+// exactly one failure mode it cannot tolerate - the bytes written
+// disagreeing with the bytes planned - and without this, such a
+// disagreement silently corrupts the output.
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (cw *countingWriter) Write(p []byte) (int, error) {
+	n, err := cw.w.Write(p)
+	cw.n += int64(n)
+	return n, err
+}
+
+// checkWritten is convertTensor's plan/stream guard, run before it
+// returns success: the bytes actually written for p must equal
+// p.totalOutLen() (owner plus all sibling tensors). A mismatch means the
+// streaming pass and the plan disagree, so the output header's offsets no
+// longer describe the file that was written - silent corruption turned
+// into a hard error.
+func checkWritten(p tensorPlan, cw *countingWriter) error {
+	if cw.n != p.totalOutLen() {
+		return fmt.Errorf("tensor %q: wrote %d bytes, planned %d", p.name, cw.n, p.totalOutLen())
+	}
+	return nil
+}
+
 // convertTensor streams one planned tensor from src - its source shard
 // file, already open by the caller - to w, reading from the plan's
-// shard-relative offset.
+// shard-relative offset. Every byte of the tensor's output (owner plus
+// siblings) goes through a countingWriter so checkWritten can verify the
+// written count against the plan; on any plan/stream disagreement it
+// fails the run instead of emitting a corrupt file.
 func convertTensor(p tensorPlan, src io.ReaderAt, w io.Writer, chunkElems int) (TensorStat, error) {
+	cw := &countingWriter{w: w}
 	stat := TensorStat{Name: p.name, FromDType: p.srcInfo.DType, ToDType: p.outDType, NumElems: p.numElems, ProtectOverride: p.protectOverride}
 
 	if p.skippedWhy != "" {
 		stat.SkippedWhy = p.skippedWhy
-		if err := copyRaw(src, w, p.srcAbsOffset, p.srcLen); err != nil {
+		if err := copyRaw(src, cw, p.srcAbsOffset, p.srcLen); err != nil {
 			return stat, fmt.Errorf("copying tensor %q: %w", p.name, err)
 		}
-		return stat, nil
+		return stat, checkWritten(p, cw)
 	}
 
 	switch p.target {
 	case TargetFP8E4M3, TargetFP8E5M2:
 		e4m3 := p.target == TargetFP8E4M3
-		if err := streamConvertFP8(src, w, p.srcAbsOffset, p.srcInfo.DType, p.numElems, chunkElems, e4m3); err != nil {
+		if err := streamConvertFP8(src, cw, p.srcAbsOffset, p.srcInfo.DType, p.numElems, chunkElems, e4m3); err != nil {
 			return stat, fmt.Errorf("converting tensor %q: %w", p.name, err)
 		}
 
@@ -550,11 +710,11 @@ func convertTensor(p tensorPlan, src io.ReaderAt, w io.Writer, chunkElems int) (
 			return stat, fmt.Errorf("scanning tensor %q: %w", p.name, err)
 		}
 		scale := int8Scale(maxAbs)
-		if err := streamConvertInt8(src, w, p.srcAbsOffset, p.srcInfo.DType, p.numElems, chunkElems, scale); err != nil {
+		if err := streamConvertInt8(src, cw, p.srcAbsOffset, p.srcInfo.DType, p.numElems, chunkElems, scale); err != nil {
 			return stat, fmt.Errorf("converting tensor %q: %w", p.name, err)
 		}
 		stat.Scale = scale
-		if err := writeF32Scale(w, p.name, scale); err != nil {
+		if err := writeF32Scale(cw, p.name, scale); err != nil {
 			return stat, err
 		}
 
@@ -564,18 +724,18 @@ func convertTensor(p tensorPlan, src io.ReaderAt, w io.Writer, chunkElems int) (
 			return stat, fmt.Errorf("scanning tensor %q: %w", p.name, err)
 		}
 		scale := int4Scale(maxAbs)
-		if err := streamInt4Data(src, w, p.srcAbsOffset, p.srcInfo.DType, p.numElems, scale, chunkElems); err != nil {
+		if err := streamInt4Data(src, cw, p.srcAbsOffset, p.srcInfo.DType, p.numElems, scale, chunkElems); err != nil {
 			return stat, fmt.Errorf("converting tensor %q: %w", p.name, err)
 		}
 		stat.Scale = scale
-		if err := writeF32Scale(w, p.name, scale); err != nil {
+		if err := writeF32Scale(cw, p.name, scale); err != nil {
 			return stat, err
 		}
 
 	case TargetInt8ConvRot:
 		// The row-scale sibling precedes the owner in the file, so the
-		// pass writes scales first, then the rotated I8 data, to w.
-		rows, err := streamConvRot(src, w, p.srcAbsOffset, p.srcInfo.DType, p.srcInfo.Shape, p.numElems, chunkElems)
+		// pass writes scales first, then the rotated I8 data, to cw.
+		rows, err := streamConvRot(src, cw, p.srcAbsOffset, p.srcInfo.DType, p.srcInfo.Shape, p.numElems, chunkElems)
 		if err != nil {
 			return stat, fmt.Errorf("converting tensor %q: %w", p.name, err)
 		}
@@ -584,16 +744,16 @@ func convertTensor(p tensorPlan, src io.ReaderAt, w io.Writer, chunkElems int) (
 	case TargetMxFP4:
 		// The block-scale sibling precedes the owner in the file, so the
 		// pass writes the E8M0 block scales first, then the packed E2M1
-		// data, to w.
-		if err := streamMxFP4(src, w, p.srcAbsOffset, p.srcInfo.DType, p.numElems, chunkElems); err != nil {
+		// data, to cw.
+		if err := streamMxFP4(src, cw, p.srcAbsOffset, p.srcInfo.DType, p.numElems, chunkElems); err != nil {
 			return stat, fmt.Errorf("converting tensor %q: %w", p.name, err)
 		}
 
 	case TargetNVFP4:
 		// The ".global_scale" and ".block_scale" siblings both precede
 		// the owner in the file, so the pass writes the F32 global scale,
-		// the E4M3 block scales, then the packed E2M1 data, to w.
-		alpha, err := streamNVFP4(src, w, p.srcAbsOffset, p.srcInfo.DType, p.numElems, chunkElems)
+		// the E4M3 block scales, then the packed E2M1 data, to cw.
+		alpha, err := streamNVFP4(src, cw, p.srcAbsOffset, p.srcInfo.DType, p.numElems, chunkElems)
 		if err != nil {
 			return stat, fmt.Errorf("converting tensor %q: %w", p.name, err)
 		}
@@ -603,7 +763,7 @@ func convertTensor(p tensorPlan, src io.ReaderAt, w io.Writer, chunkElems int) (
 		return stat, fmt.Errorf("tensor %q: unhandled target kind %v", p.name, p.target)
 	}
 
-	return stat, nil
+	return stat, checkWritten(p, cw)
 }
 
 // appendHeaderEntry records one tensor's header entry given its already-
@@ -643,6 +803,10 @@ func streamComputeMaxAbsScale(r io.ReaderAt, offset int64, srcDType DType, numEl
 		return 0, err
 	}
 	buf := make([]byte, chunkElems*elemSize)
+	// One chunk-sized f32 scratch reused across all chunks: the decode
+	// fills at most chunkElems slots, so peak memory stays O(chunk) and
+	// no per-chunk allocation churn is left for the GC.
+	fbuf := make([]float32, chunkElems)
 
 	var maxAbs float32
 	var done int64
@@ -655,7 +819,7 @@ func streamComputeMaxAbsScale(r io.ReaderAt, offset int64, srcDType DType, numEl
 		if _, err := r.ReadAt(chunkBuf, offset+done*int64(elemSize)); err != nil {
 			return 0, err
 		}
-		floats, err := toFloat32Slice(chunkBuf, srcDType)
+		floats, err := toFloat32SliceInto(fbuf, chunkBuf, srcDType)
 		if err != nil {
 			return 0, err
 		}
@@ -677,11 +841,12 @@ func streamComputeMaxAbsScale(r io.ReaderAt, offset int64, srcDType DType, numEl
 }
 
 // writeF32Scale writes the 4-byte little-endian F32 payload of a ".scale"
-// sibling (int8 and int4) after the owner's data on w.
+// sibling (int8 and int4) after the owner's data on w. The 4-byte payload
+// is a stack array, so the call allocates nothing.
 func writeF32Scale(w io.Writer, name string, scale float32) error {
-	scaleBytes := make([]byte, 4)
-	binary.LittleEndian.PutUint32(scaleBytes, math.Float32bits(scale))
-	if _, err := w.Write(scaleBytes); err != nil {
+	var scaleBytes [4]byte
+	binary.LittleEndian.PutUint32(scaleBytes[:], math.Float32bits(scale))
+	if _, err := w.Write(scaleBytes[:]); err != nil {
 		return fmt.Errorf("writing scale for tensor %q: %w", name, err)
 	}
 	return nil
@@ -697,6 +862,9 @@ func streamConvertFP8(r io.ReaderAt, w io.Writer, offset int64, srcDType DType, 
 	}
 	inBuf := make([]byte, chunkElems*elemSize)
 	outBuf := make([]byte, chunkElems)
+	// One chunk-sized f32 scratch reused across all chunks (see
+	// streamComputeMaxAbsScale): O(chunk) memory, no per-chunk allocations.
+	fbuf := make([]float32, chunkElems)
 
 	var done int64
 	for done < numElems {
@@ -708,7 +876,7 @@ func streamConvertFP8(r io.ReaderAt, w io.Writer, offset int64, srcDType DType, 
 		if _, err := r.ReadAt(chunkIn, offset+done*int64(elemSize)); err != nil {
 			return err
 		}
-		floats, err := toFloat32Slice(chunkIn, srcDType)
+		floats, err := toFloat32SliceInto(fbuf, chunkIn, srcDType)
 		if err != nil {
 			return err
 		}
@@ -737,6 +905,9 @@ func streamConvertInt8(r io.ReaderAt, w io.Writer, offset int64, srcDType DType,
 	}
 	inBuf := make([]byte, chunkElems*elemSize)
 	outBuf := make([]byte, chunkElems)
+	// One chunk-sized f32 scratch reused across all chunks (see
+	// streamComputeMaxAbsScale): O(chunk) memory, no per-chunk allocations.
+	fbuf := make([]float32, chunkElems)
 
 	var done int64
 	for done < numElems {
@@ -748,7 +919,7 @@ func streamConvertInt8(r io.ReaderAt, w io.Writer, offset int64, srcDType DType,
 		if _, err := r.ReadAt(chunkIn, offset+done*int64(elemSize)); err != nil {
 			return err
 		}
-		floats, err := toFloat32Slice(chunkIn, srcDType)
+		floats, err := toFloat32SliceInto(fbuf, chunkIn, srcDType)
 		if err != nil {
 			return err
 		}
@@ -764,10 +935,13 @@ func streamConvertInt8(r io.ReaderAt, w io.Writer, offset int64, srcDType DType,
 	return nil
 }
 
-// toFloat32Slice decodes raw tensor bytes of the given source dtype into a
-// []float32 for uniform downstream processing. Used per-chunk, not on
-// whole tensors, so its allocation is bounded by the caller's chunk size.
-func toFloat32Slice(raw []byte, dtype DType) ([]float32, error) {
+// toFloat32SliceInto decodes raw tensor bytes of the given source dtype
+// into the caller-provided scratch dst and returns the filled prefix
+// dst[:n]. The streaming passes pass one chunk-sized dst (len = chunkElems)
+// and reuse it for every chunk, so the decode allocates nothing per chunk
+// and the decoded values stay bounded by the caller's chunk size; the
+// caller must provide len(dst) >= the decoded element count.
+func toFloat32SliceInto(dst []float32, raw []byte, dtype DType) ([]float32, error) {
 	size, err := dtype.ByteSize()
 	if err != nil {
 		return nil, err
@@ -776,7 +950,10 @@ func toFloat32Slice(raw []byte, dtype DType) ([]float32, error) {
 		return nil, fmt.Errorf("raw byte length %d not a multiple of element size %d", len(raw), size)
 	}
 	n := len(raw) / size
-	out := make([]float32, n)
+	if len(dst) < n {
+		return nil, fmt.Errorf("dst too small: %d float32 slots needed, have %d", n, len(dst))
+	}
+	out := dst[:n]
 
 	switch dtype {
 	case DTypeF32:
@@ -803,4 +980,19 @@ func toFloat32Slice(raw []byte, dtype DType) ([]float32, error) {
 		return nil, fmt.Errorf("unsupported source float dtype %q", dtype)
 	}
 	return out, nil
+}
+
+// toFloat32Slice decodes raw tensor bytes of the given source dtype into a
+// fresh []float32 for uniform downstream processing. The streaming passes
+// use toFloat32SliceInto with a reused chunk-sized scratch instead; this
+// wrapper remains for one-shot callers (and the tests).
+func toFloat32Slice(raw []byte, dtype DType) ([]float32, error) {
+	size, err := dtype.ByteSize()
+	if err != nil {
+		return nil, err
+	}
+	if size == 0 || len(raw)%size != 0 {
+		return nil, fmt.Errorf("raw byte length %d not a multiple of element size %d", len(raw), size)
+	}
+	return toFloat32SliceInto(make([]float32, len(raw)/size), raw, dtype)
 }

@@ -278,6 +278,62 @@ func TestPlanShardOutputIndexKeyOrder(t *testing.T) {
 	}
 }
 
+// TestPlanShardOutputMergesIndexMetadata pins the output index's metadata
+// merge rule: the input index's metadata is copied into the output index
+// (so HF keys like "architectures" survive) and only total_size is
+// overridden with the plan-computed value.
+func TestPlanShardOutputMergesIndexMetadata(t *testing.T) {
+	plans, _, err := planModel(ConvertOptions{InputShards: multiShardPaths(), Default: TargetInt8})
+	if err != nil {
+		t.Fatalf("planModel: %v", err)
+	}
+	loadIn := func() *Index {
+		t.Helper()
+		idx, err := LoadIndex(filepath.Join(fixtureDir, fixtureIndexName))
+		if err != nil {
+			t.Fatalf("LoadIndex: %v", err)
+		}
+		return idx
+	}
+
+	t.Run("input metadata is kept, total_size overridden", func(t *testing.T) {
+		inIdx := loadIn()
+		inIdx.Metadata = map[string]any{
+			"architectures": []any{"X"},
+			"foo":           1,
+			"total_size":    999999,
+		}
+		_, outIdx, err := PlanShardOutput(plans, inIdx, t.TempDir())
+		if err != nil {
+			t.Fatalf("PlanShardOutput: %v", err)
+		}
+		// 44 is the int8 plan total pinned in TestPlanShardOutput, proving
+		// total_size came from the plan, not the input's 999999.
+		want := map[string]any{"architectures": []any{"X"}, "foo": 1, "total_size": int64(44)}
+		if !reflect.DeepEqual(outIdx.Metadata, want) {
+			t.Errorf("output index metadata = %v, want %v", outIdx.Metadata, want)
+		}
+		// The copy is top-level: mutating the output metadata must not
+		// touch the input index's map.
+		outIdx.Metadata["extra"] = 1
+		if _, ok := inIdx.Metadata["extra"]; ok {
+			t.Errorf("output metadata shares the input index's map; expected a copy")
+		}
+	})
+
+	t.Run("nil input metadata", func(t *testing.T) {
+		inIdx := loadIn()
+		inIdx.Metadata = nil
+		_, outIdx, err := PlanShardOutput(plans, inIdx, t.TempDir())
+		if err != nil {
+			t.Fatalf("PlanShardOutput: %v", err)
+		}
+		if want := map[string]any{"total_size": int64(44)}; !reflect.DeepEqual(outIdx.Metadata, want) {
+			t.Errorf("output index metadata = %v, want %v (only total_size)", outIdx.Metadata, want)
+		}
+	})
+}
+
 func TestPlanShardOutputErrors(t *testing.T) {
 	plans, _, err := planModel(ConvertOptions{InputShards: multiShardPaths(), Default: TargetNone})
 	if err != nil {

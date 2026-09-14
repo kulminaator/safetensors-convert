@@ -28,6 +28,11 @@ func streamInt4Data(r io.ReaderAt, w io.Writer, offset int64, srcDType DType, nu
 	}
 	inBuf := make([]byte, chunkElems*elemSize)
 	nibBuf := make([]uint8, chunkElems)
+	// One chunk-sized f32 decode scratch and one packed-output buffer
+	// (at most (chunkElems+1)/2 bytes) reused across all chunks: O(chunk)
+	// memory, no per-chunk allocations.
+	fbuf := make([]float32, chunkElems)
+	packedBuf := make([]byte, (chunkElems+1)/2)
 
 	var done int64
 	for done < numElems {
@@ -39,14 +44,14 @@ func streamInt4Data(r io.ReaderAt, w io.Writer, offset int64, srcDType DType, nu
 		if _, err := r.ReadAt(chunkIn, offset+done*int64(elemSize)); err != nil {
 			return err
 		}
-		floats, err := toFloat32Slice(chunkIn, srcDType)
+		floats, err := toFloat32SliceInto(fbuf, chunkIn, srcDType)
 		if err != nil {
 			return err
 		}
 		for i, f := range floats {
 			nibBuf[i] = uint8(f32ToInt4RNE(f, scale) & 0x0F)
 		}
-		if _, err := w.Write(packNibbles(nibBuf[:n])); err != nil {
+		if _, err := w.Write(packNibblesInto(packedBuf, nibBuf[:n])); err != nil {
 			return err
 		}
 		done += n
@@ -78,8 +83,9 @@ const mxfp4Block = 32
 // below one block becomes a single block), so an interior read never
 // splits a block - only the tensor's final block may be partial, and its
 // packNibbles zero-pads the trailing nibble. The only non-chunk state is
-// the decoded 32-element f32 block buffer and one scalar (block max /
-// code), both bounded constants.
+// the chunk-sized f32 decode buffer, the 32-element quantized-value
+// buffer, the 16-byte packed-output buffer, and the block max / code
+// scalars - all bounded by the chunk or block size, never the tensor.
 func streamMxFP4(r io.ReaderAt, w io.Writer, offset int64, srcDType DType, numElems int64, chunkElems int) error {
 	elemSize, err := srcDType.ByteSize()
 	if err != nil {
@@ -94,6 +100,13 @@ func streamMxFP4(r io.ReaderAt, w io.Writer, offset int64, srcDType DType, numEl
 		chunk = (c + mxfp4Block - 1) / mxfp4Block * mxfp4Block
 	}
 	rawBuf := make([]byte, chunk*int64(elemSize))
+	// fbuf is the chunk-sized f32 decode scratch reused by forEachBlock
+	// across all chunks; qs and packedBuf are the per-block scratch for
+	// pass 2 (one block = at most 32 quantized values, (32+1)/2 packed
+	// bytes). Bounded by the chunk or block size, never the tensor.
+	fbuf := make([]float32, chunk)
+	qs := make([]uint8, mxfp4Block)
+	packedBuf := make([]byte, (mxfp4Block+1)/2)
 
 	// blockMax is the max |v| over vals, ignoring NaN/Inf (same convention
 	// as the int8 max-abs scan: those are clamped at quantize time).
@@ -129,7 +142,7 @@ func streamMxFP4(r io.ReaderAt, w io.Writer, offset int64, srcDType DType, numEl
 			if _, err := r.ReadAt(chunkRaw, offset+start*int64(elemSize)); err != nil {
 				return err
 			}
-			fl, err := toFloat32Slice(chunkRaw, srcDType)
+			fl, err := toFloat32SliceInto(fbuf, chunkRaw, srcDType)
 			if err != nil {
 				return err
 			}
@@ -160,17 +173,19 @@ func streamMxFP4(r io.ReaderAt, w io.Writer, offset int64, srcDType DType, numEl
 
 	// Pass 2 (data): recompute each block's max and code, quantize the
 	// elements to E2M1 at the decoded scale, and pack two per byte.
+	// qs/packedBuf are the hoisted per-block scratch (see above); the
+	// write completes before the next block reuses them.
 	if err := forEachBlock(func(vals []float32) error {
 		s := e8m0Scale(e8m0Encode(blockMax(vals)))
-		qs := make([]uint8, len(vals))
+		qv := qs[:len(vals)]
 		for i, v := range vals {
 			if s == 0 {
-				qs[i] = 0
+				qv[i] = 0
 			} else {
-				qs[i] = f32ToE2M1(v / s)
+				qv[i] = f32ToE2M1(v / s)
 			}
 		}
-		_, err := w.Write(packNibbles(qs))
+		_, err := w.Write(packNibblesInto(packedBuf, qv))
 		return err
 	}); err != nil {
 		return err
@@ -216,8 +231,10 @@ const nvfp4Block = 16
 // below one block becomes a single block), so an interior read never
 // splits a block - only the tensor's final block may be partial, and its
 // packNibbles zero-pads the trailing nibble. The only non-chunk state is
-// the decoded 16-element f32 block buffer and the scalars M, alpha, and
-// the block max - all bounded constants.
+// the chunk-sized f32 decode buffer, the 16-element quantized-value
+// buffer, the 8-byte packed-output buffer, and the scalars M, alpha, and
+// the block max - all bounded by the chunk or block size, never the
+// tensor.
 func streamNVFP4(r io.ReaderAt, w io.Writer, offset int64, srcDType DType, numElems int64, chunkElems int) (float32, error) {
 	elemSize, err := srcDType.ByteSize()
 	if err != nil {
@@ -243,6 +260,13 @@ func streamNVFP4(r io.ReaderAt, w io.Writer, offset int64, srcDType DType, numEl
 		chunk = (c + nvfp4Block - 1) / nvfp4Block * nvfp4Block
 	}
 	rawBuf := make([]byte, chunk*int64(elemSize))
+	// fbuf is the chunk-sized f32 decode scratch reused by forEachBlock
+	// across all chunks; qs and packedBuf are the per-block scratch for
+	// pass 2 (one block = at most 16 quantized values, (16+1)/2 packed
+	// bytes). Bounded by the chunk or block size, never the tensor.
+	fbuf := make([]float32, chunk)
+	qs := make([]uint8, nvfp4Block)
+	packedBuf := make([]byte, (nvfp4Block+1)/2)
 
 	// blockMax is the max |v| over vals, ignoring NaN/Inf (same
 	// convention as the int8 max-abs scan: those are clamped at
@@ -279,7 +303,7 @@ func streamNVFP4(r io.ReaderAt, w io.Writer, offset int64, srcDType DType, numEl
 			if _, err := r.ReadAt(chunkRaw, offset+start*int64(elemSize)); err != nil {
 				return err
 			}
-			fl, err := toFloat32Slice(chunkRaw, srcDType)
+			fl, err := toFloat32SliceInto(fbuf, chunkRaw, srcDType)
 			if err != nil {
 				return err
 			}
@@ -326,18 +350,19 @@ func streamNVFP4(r io.ReaderAt, w io.Writer, offset int64, srcDType DType, numEl
 
 	// Pass 2 (data): recompute each block's scale byte, decode it, and
 	// quantize the elements to E2M1 at the step alpha*s, packing two per
-	// byte.
+	// byte. qs/packedBuf are the hoisted per-block scratch (see above);
+	// the write completes before the next block reuses them.
 	if err := forEachBlock(func(vals []float32) error {
 		step := alpha * f8E4M3ToF32(scaleByte(vals))
-		qs := make([]uint8, len(vals))
+		qv := qs[:len(vals)]
 		for i, v := range vals {
 			if step == 0 {
-				qs[i] = 0
+				qv[i] = 0
 			} else {
-				qs[i] = f32ToE2M1(v / step)
+				qv[i] = f32ToE2M1(v / step)
 			}
 		}
-		_, err := w.Write(packNibbles(qs))
+		_, err := w.Write(packNibblesInto(packedBuf, qv))
 		return err
 	}); err != nil {
 		return 0, err
@@ -387,22 +412,50 @@ func hadamard256(buf []float32) {
 // rotation at inference time.
 //
 // The conversion takes three chunked passes over the source (scales, row
-// rescan, quantize) and buffers nothing that grows with the tensor: the
-// only non-chunk state is the 256-element group buffer (1KB of f32) and
-// the current row's max - both bounded constants. Rotation groups are the
-// atomic read unit (a group is always read whole and rotated in place),
-// so chunkElems does not further subdivide the reads; it is kept for API
-// consistency with the other streaming passes.
+// rescan, quantize). Raw reads are windowed: instead of one 256-byte
+// ReadAt per group (about 4M syscalls per GB per pass, and there are
+// three), the source is read in windows of chunkElems elements (rounded
+// up to whole 256-element groups, at least one group) and each group is
+// served from the window when in range. The window buffer is the only
+// state that scales with the chunk (O(chunk), like every other pass);
+// the rest is the fixed 256-element group buffer (1KB of f32) and the
+// current row's max - nothing grows with the tensor.
 //
 // w must be positioned at the ".scale" region: pass 1 writes the per-row
 // scales in row order, then pass 2 writes the quantized data - matching
 // the header layout, which emits the row-scale sibling before the owner.
-// numElems must be a multiple of 256 (planTensor skips anything else).
+// numElems must be a multiple of 256 (planTensor skips anything else);
+// zero-element tensors are handled up front: they write exactly the
+// planned row scales (one per row, int8Scale(0)) and no data.
 func streamConvRot(r io.ReaderAt, w io.Writer, offset int64, srcDType DType, shape []int64, numElems int64, chunkElems int) (int, error) {
-	_ = chunkElems // see the comment above: group reads are the atomic unit
 	elemSize, err := srcDType.ByteSize()
 	if err != nil {
 		return 0, err
+	}
+
+	// Zero-element tensors: no data to read, no groups to rotate, and the
+	// row-width check below would divide by zero (a 1-D tensor's row width
+	// is numElems itself). Write exactly the sibling bytes planSiblings
+	// planned - one F32 scale per row, with a 1-D tensor counting as one
+	// row and a 2-D (or wider) tensor shape[0] rows - each
+	// int8Scale(0) = 1.0, the same value an all-zero row would produce.
+	// The output header's data_offsets were planned from this same
+	// formula, so the written bytes must match the planned sibling bytes
+	// exactly, or every tensor after this one in the file shifts by the
+	// difference (silent corruption).
+	if numElems == 0 {
+		rows := int64(1)
+		if len(shape) >= 2 {
+			rows = shape[0]
+		}
+		var scaleBuf [4]byte
+		binary.LittleEndian.PutUint32(scaleBuf[:], math.Float32bits(int8Scale(0)))
+		for i := int64(0); i < rows; i++ {
+			if _, err := w.Write(scaleBuf[:]); err != nil {
+				return 0, err
+			}
+		}
+		return int(rows), nil
 	}
 
 	// c is the row width in elements; the row of element i is i/c. A 1-D
@@ -421,19 +474,63 @@ func streamConvRot(r io.ReaderAt, w io.Writer, offset int64, srcDType DType, sha
 	}
 	rows := numElems / c
 
-	// One group read/rotate: read 256 consecutive elements, decode, and
-	// rotate in place. rawBuf and group are the only non-chunk state.
-	rawBuf := make([]byte, convrotGroup*elemSize)
+	// Windowed reads: the raw read unit is a window of whole rotation
+	// groups, not a single group. winElems is the caller's chunkElems
+	// rounded up to the next multiple of convrotGroup (a value below one
+	// group becomes one group - the same clamp as the mxfp4/nvfp4 block
+	// rounding), so a group never straddles a window boundary and
+	// chunkElems drives the reads like in every other pass.
+	winElems := int64(convrotGroup)
+	if c := int64(chunkElems); c > winElems {
+		winElems = (c + convrotGroup - 1) / convrotGroup * convrotGroup
+	}
+	// Memory bound: winBuf is the only allocation that scales with the
+	// chunk (O(chunk), like the other passes' decode scratch); the group
+	// buffer below is a fixed 256 f32. Nothing here grows with the
+	// tensor or the file.
+	winBuf := make([]byte, winElems*int64(elemSize))
+	// winStart is the first group index in the window; winEnd the first
+	// past it (exclusive); -1/-1 = empty. The last window of a pass may
+	// be shorter than winElems: it is clamped to the tensor's end so a
+	// read never crosses into the next tensor's bytes or past EOF.
+	var winStart, winEnd int64 = -1, -1
+	loadWindow := func(g int64) error {
+		n := winElems
+		if rem := numElems - g*convrotGroup; rem < n {
+			n = rem
+		}
+		if _, err := r.ReadAt(winBuf[:n*int64(elemSize)], offset+g*convrotGroup*int64(elemSize)); err != nil {
+			return err
+		}
+		winStart, winEnd = g, g+n/convrotGroup
+		return nil
+	}
+
+	// readGroup rotates group g into group. It serves g from the window
+	// when in range, else re-reads a window starting at g. Group visits
+	// are in non-decreasing index order in every sweep: pass 1 walks
+	// 0..G-1 flat, and the passes 2/3 row rescans/quantizes walk each
+	// row's groups g0..g1 in order with rows ascending and contiguous
+	// (row rr+1's g0 = (rr+1)*c/256 is >= row rr's g1 =
+	// ((rr+1)*c-1)/256), so within a sweep the window only ever moves
+	// forward. The one backward step - a row's rescan end to its
+	// quantize start (g1 back to g0) - falls out of the window and
+	// triggers a re-read; the range check below is correct for any visit
+	// order, so monotonicity is a performance property, not a
+	// correctness one. The decode reads straight out of the window into
+	// group, so a group visit allocates nothing.
 	group := make([]float32, convrotGroup)
 	readGroup := func(g int64) error {
-		if _, err := r.ReadAt(rawBuf, offset+g*convrotGroup*int64(elemSize)); err != nil {
+		if g < winStart || g >= winEnd {
+			if err := loadWindow(g); err != nil {
+				return err
+			}
+		}
+		es := int64(elemSize)
+		base := (g - winStart) * convrotGroup * es
+		if _, err := toFloat32SliceInto(group, winBuf[base:base+convrotGroup*es], srcDType); err != nil {
 			return err
 		}
-		f, err := toFloat32Slice(rawBuf, srcDType)
-		if err != nil {
-			return err
-		}
-		copy(group, f)
 		hadamard256(group)
 		return nil
 	}

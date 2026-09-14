@@ -30,9 +30,10 @@ type ShardOut struct {
 // tensor-to-shard assignment for every planned tensor (a ".scale" sibling
 // gets its owner's shard; a tensor missing from the input index -
 // defensive, a consistent index names every tensor - goes to the shard
-// that holds it), and its total_size is recomputed from the plan: the
-// input's total_size describes the input and is meaningless for the
-// output.
+// that holds it). Its metadata is a copy of the input index's metadata
+// (e.g. HF's "architectures"), overriding only total_size, which is
+// recomputed from the plan: the input's total_size describes the input
+// and would be wrong for the output.
 //
 // inIndex is required: multi-file output exists to replicate a
 // model-directory input's sharding, and the tensor-to-shard assignments
@@ -117,8 +118,15 @@ func PlanShardOutput(plans []tensorPlan, inIndex *Index, outDir string) ([]Shard
 		shards = append(shards, sh)
 	}
 
-	// Computed from the plan, never copied from the input index.
-	outIndex.Metadata = map[string]any{"total_size": total}
+	// Merge the input index's metadata, overriding only total_size (which
+	// is computed from the plan, never copied: the input's value describes
+	// the input). A shallow top-level copy is enough; the values are
+	// read-only here. Memory is O(index metadata size), trivially bounded.
+	outIndex.Metadata = make(map[string]any, len(inIndex.Metadata)+1)
+	for k, v := range inIndex.Metadata {
+		outIndex.Metadata[k] = v
+	}
+	outIndex.Metadata["total_size"] = total
 	return shards, outIndex, nil
 }
 

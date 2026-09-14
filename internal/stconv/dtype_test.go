@@ -54,6 +54,15 @@ func TestF8E4M3Max(t *testing.T) {
 	if !math.IsNaN(float64(got)) {
 		t.Errorf("expected NaN for large overflow, got %v", got)
 	}
+	// +/-Inf saturate to the NaN pattern, explicitly (B4 audit): pre-fix,
+	// +Inf fell through Frexp (Frexp(Inf) = (Inf, 0)) and mis-encoded to
+	// 0x38 = 1.0 instead of the convention's sentinel.
+	if got := f32ToF8E4M3(float32(math.Inf(1))); got != 0x7F {
+		t.Errorf("f32ToF8E4M3(+Inf) = %02x, want 7f", got)
+	}
+	if got := f32ToF8E4M3(float32(math.Inf(-1))); got != 0xFF {
+		t.Errorf("f32ToF8E4M3(-Inf) = %02x, want ff", got)
+	}
 }
 
 func TestE4M3RNEPinned(t *testing.T) {
@@ -149,6 +158,27 @@ func TestInt8QuantizeSymmetric(t *testing.T) {
 	}
 }
 
+// TestF32ToInt8SpecialValues pins the file-header NaN/Inf convention for
+// f32ToInt8 (B4): NaN quantizes to 0 explicitly (int8(NaN) is
+// implementation-defined per the Go spec - 0 on amd64 today, but not
+// guaranteed), +/-Inf clamp to +/-127.
+func TestF32ToInt8SpecialValues(t *testing.T) {
+	scale := int8Scale(10.0)
+	cases := []struct {
+		in   float32
+		want int8
+	}{
+		{math.Float32frombits(0x7fc00000), 0}, // NaN
+		{float32(math.Inf(1)), 127},
+		{float32(math.Inf(-1)), -127},
+	}
+	for _, c := range cases {
+		if got := f32ToInt8(c.in, scale); got != c.want {
+			t.Errorf("f32ToInt8(%v, %v) = %d, want %d", c.in, scale, got, c.want)
+		}
+	}
+}
+
 func TestInt4Scale(t *testing.T) {
 	cases := []struct {
 		maxAbs float32
@@ -180,6 +210,7 @@ func TestF32ToInt4RNE(t *testing.T) {
 		{6.5, 6},
 		{7, 7},
 		{7.4, 7},
+		{7.5, 7}, // RNE tie to 8, clamped to 7
 		{7.6, 7}, // RNE would give 8, clamped to 7
 		{-0.5, 0},
 		{-1.5, -2},
@@ -205,6 +236,22 @@ func TestF32ToInt4RNE(t *testing.T) {
 	// RNE contrast vs math.Round: 2.5 quantizes to 2, not 3.
 	if got := f32ToInt4RNE(2.5, 1); got != 2 {
 		t.Errorf("RNE tie 2.5 = %d, want 2 (half-away would give 3)", got)
+	}
+	// Out-of-int32-range quotients must clamp to ±7 in float space (B2):
+	// pre-fix, int32(av) overflowed and f32ToInt4RNE(1e20, 1e-3) returned
+	// 1 instead of 7.
+	ovf := []struct {
+		f, scale float32
+		want     int8
+	}{
+		{1e20, 1e-3, 7},
+		{-1e20, 1e-3, -7},
+		{1e30, 1, 7},
+	}
+	for _, c := range ovf {
+		if got := f32ToInt4RNE(c.f, c.scale); got != c.want {
+			t.Errorf("f32ToInt4RNE(%g, %g) = %d, want %d", c.f, c.scale, got, c.want)
+		}
 	}
 }
 
@@ -476,6 +523,53 @@ func TestPackNibbles(t *testing.T) {
 		}
 		if n%2 == 1 && got[n] != 0 {
 			t.Errorf("round trip n=%d: pad nibble = %x, want 0", n, got[n])
+		}
+	}
+}
+
+// TestPackNibblesInto pins the pack-into-scratch variant the streaming
+// passes use: same layout as packNibbles, into the caller's buffer, and -
+// crucially - no stale-nibble leakage when the buffer is reused across
+// packs of different lengths (an odd pack's pad nibble must be zero even
+// if the buffer previously held a longer pack).
+func TestPackNibblesInto(t *testing.T) {
+	dst := make([]byte, 8)
+	// Even count: same bytes as the allocating wrapper, aliasing dst.
+	got := packNibblesInto(dst, []uint8{0x1, 0x2})
+	if !bytes.Equal(got, []byte{0x21}) {
+		t.Errorf("into([1,2]) = %x, want 21", got)
+	}
+	if &got[0] != &dst[0] {
+		t.Fatal("result does not alias the caller's dst")
+	}
+	// Odd count: trailing zero pad nibble, identical to the wrapper.
+	if got := packNibblesInto(dst, []uint8{0xA, 0xB, 0xC}); !bytes.Equal(got, []byte{0xBA, 0x0C}) {
+		t.Errorf("into([A,B,C]) = %x, want ba 0c", got)
+	}
+	// Reuse: dst[0] still holds the 0xBA/0x21 leftovers from the packs
+	// above; packing one value writes only the low nibble of byte 0, so
+	// the high nibble must be zeroed, not leaked from the previous pack.
+	if got := packNibblesInto(dst, []uint8{0x5}); !bytes.Equal(got, []byte{0x05}) {
+		t.Errorf("into([5]) on reused dst = %x, want 05 (stale high nibble leaked?)", got)
+	}
+	// Empty input: empty prefix, buffer untouched by the call.
+	if got := packNibblesInto(dst, nil); len(got) != 0 {
+		t.Errorf("into(nil) = %x, want empty", got)
+	}
+	// Exhaustive: for every length 0..7, into agrees with the wrapper on
+	// a reused (dirty) buffer.
+	dirty := make([]byte, 4)
+	for i := range dirty {
+		dirty[i] = 0xFF
+	}
+	for n := 0; n <= 7; n++ {
+		vals := make([]uint8, n)
+		for i := range vals {
+			vals[i] = uint8(0xF - i) // descending, so stale bytes differ from packed ones
+		}
+		want := packNibbles(vals)
+		if got := packNibblesInto(dirty, vals); !bytes.Equal(got, want) {
+			t.Errorf("n=%d: into on dirty dst = %x, wrapper = %x", n, got, want)
 		}
 	}
 }

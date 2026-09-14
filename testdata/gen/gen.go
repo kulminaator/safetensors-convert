@@ -9,6 +9,7 @@
 //	go run ./testdata/gen single256 <outFile> // one BF16 [2,128] tensor (256 elems, outlier)
 //	go run ./testdata/gen multirot <outDir>   // 2-shard model dir with 256-elem tensors
 //	go run ./testdata/gen qwenlike <outFile>  // one BF16 file named like a small Qwen model
+//	go run ./testdata/gen empty <outFile>     // one BF16 file with zero-element tensors
 //
 // Tensor values are fixed below so tests can spot-check converted output
 // against known inputs.
@@ -272,6 +273,42 @@ func writeSingle256(outPath string) {
 	writeSafetensors(outPath, []fixtureTensor{rotWeightTensor()}, false)
 }
 
+// emptyBigTensor is a BF16 [256] tensor (one ConvRot rotation group) with
+// a deterministic value pattern: 0.05*(i%7-3) (range [-0.15, 0.15]) plus an
+// outlier at index 100 = 33.0 that sets the row scale.
+func emptyBigTensor() fixtureTensor {
+	vals := make([]float32, 256)
+	for i := range vals {
+		vals[i] = 0.05 * float32(i%7-3)
+	}
+	vals[100] = 33.0
+	return fixtureTensor{name: "big.w", dtype: "BF16", shape: "[256]", data: packBF16(vals...)}
+}
+
+// emptySmallTensor is a BF16 [16] tensor (not a multiple of the ConvRot
+// group size of 256, so it exercises the convrot skip): 0.1*i for
+// i in 0..15.
+func emptySmallTensor() fixtureTensor {
+	vals := make([]float32, 16)
+	for i := range vals {
+		vals[i] = 0.1 * float32(i)
+	}
+	return fixtureTensor{name: "small.w", dtype: "BF16", shape: "[16]", data: packBF16(vals...)}
+}
+
+// writeEmpty writes a single BF16 file whose header order is: empty2d.w
+// [0,8] (zero elements), big.w [256] (a ConvRot group, fixed values),
+// empty1d.w [0] (zero elements), small.w [16] (not a 256-multiple).
+// It is the fixture for the zero-element convrot regression test.
+func writeEmpty(outPath string) {
+	writeSafetensors(outPath, []fixtureTensor{
+		{name: "empty2d.w", dtype: "BF16", shape: "[0,8]", data: nil},
+		emptyBigTensor(),
+		{name: "empty1d.w", dtype: "BF16", shape: "[0]", data: nil},
+		emptySmallTensor(),
+	}, false)
+}
+
 // qwenLikeTensor is a small BF16 tensor with a deterministic value
 // pattern (0.05*(i%7-3), range [-0.15, 0.15]); n is the element count.
 // The e2e tests assert dtypes and passthrough byte identity, not
@@ -402,7 +439,7 @@ func writeIndex(path string, shards []shard, totalSize int) {
 
 func main() {
 	if len(os.Args) != 3 {
-		fmt.Fprintln(os.Stderr, "usage: gen single <outFile> | gen multi <outDir> | gen single256 <outFile> | gen multirot <outDir> | gen qwenlike <outFile>")
+		fmt.Fprintln(os.Stderr, "usage: gen single <outFile> | gen multi <outDir> | gen single256 <outFile> | gen multirot <outDir> | gen qwenlike <outFile> | gen empty <outFile>")
 		os.Exit(1)
 	}
 	switch os.Args[1] {
@@ -416,6 +453,8 @@ func main() {
 		writeMultiRot(os.Args[2])
 	case "qwenlike":
 		writeQwenLike(os.Args[2])
+	case "empty":
+		writeEmpty(os.Args[2])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown mode %q\n", os.Args[1])
 		os.Exit(1)

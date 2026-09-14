@@ -5,11 +5,14 @@ import (
 	"math/bits"
 )
 
-// This file implements float32 <-> {float16, bfloat16, float8_e4m3fn,
-// float8_e5m2, int8, int4, e2m1} conversions plus the E8M0 block-scale
-// codec, a round-to-nearest-even e4m3 encoder for the NVFP4 block-scale
-// path, and the shared 4-bit nibble packing, using only the standard
-// library.
+// This file implements the production dtype conversions: decoders from
+// {float16, bfloat16, float8_e4m3fn, float8_e5m2} to float32, encoders from
+// float32 to {float8_e4m3fn, float8_e5m2, int8, int4, e2m1}, the E8M0
+// block-scale codec, a round-to-nearest-even e4m3 encoder for the NVFP4
+// block-scale path, and the shared 4-bit nibble packing, using only the
+// standard library. The test-only round-trip/encoder counterparts (f32ToF16,
+// f32ToBF16, int8ToF32, int4ToF32, e2m1ToF32, unpackNibbles) live in
+// dtype_helpers_test.go.
 //
 // float8_e4m3fn and float8_e5m2 follow the OCP 8-bit floating point spec
 // (the same layouts used by PyTorch's torch.float8_e4m3fn / torch.float8_e5m2
@@ -22,57 +25,29 @@ import (
 //   e5m2:   1 sign | 5 exponent (bias 15) | 2 mantissa. IEEE-754-like:
 //           exponent==0x1F, mantissa==0 is +/-Inf, mantissa!=0 is NaN.
 //           Max finite magnitude is 57344.
+//
+// NaN/Inf convention for the quantizing encoders: NaN quantizes to 0; +/-Inf
+// clamps to the format's finite max; every quantizing encoder does this
+// EXPLICITLY - none of them rely on the implementation-defined float->int
+// conversions of the Go spec (e.g. int8(NaN) is 0 on amd64 today, but the
+// spec does not guarantee it). Concretely:
+//
+//   - int8 (f32ToInt8): NaN -> 0; +/-Inf -> +/-127.
+//   - int4 (f32ToInt4RNE): NaN -> 0; +/-Inf -> +/-7.
+//   - e2m1 (f32ToE2M1): NaN -> 0x00 (no NaN code exists); +/-Inf -> +/-6.
+//   - e4m3fn (f32ToF8E4M3, f32ToE4M3RNE): NaN and +/-Inf -> the 0x7F
+//     pattern - the same sentinel finite overflow already saturates to,
+//     since e4m3fn has no infinity.
+//   - e5m2 (f32ToF8E5M2): NaN -> the NaN pattern; +/-Inf -> the Inf
+//     pattern (e5m2 represents infinity, so it is kept, not clamped).
+//   - e8m0 (e8m0Encode, a scale codec): NaN and m <= 0 -> code 0 (scale
+//     0); +Inf -> code 254 (saturates; callers pass finite block maxima).
+//
+// The max-abs scale scans in convert.go/quant.go skip NaN/Inf on the
+// strength of this promise: such values can never poison a scale and are
+// pinned to defined output codes by the encoder they are passed to.
 
 // ---------- float16 (IEEE-754 binary16) ----------
-
-func f32ToF16(f float32) uint16 {
-	sign := uint16(0)
-	if math.Signbit(float64(f)) {
-		sign = 0x8000
-	}
-	af := math.Abs(float64(f))
-
-	switch {
-	case math.IsNaN(float64(f)):
-		return sign | 0x7E00
-	case math.IsInf(float64(f), 0):
-		return sign | 0x7C00
-	case af == 0:
-		return sign
-	}
-
-	frac, exp := math.Frexp(af) // af = frac * 2^exp, frac in [0.5,1)
-	m := frac * 2               // in [1,2)
-	e := int32(exp) - 1
-	biasedExp := e + 15
-
-	const manBits = 10
-	const denom = 1 << manBits // 1024
-
-	if biasedExp < 1 {
-		// Subnormal or underflow. Smallest normal is 2^-14.
-		val := af / math.Pow(2, -14) * denom // value in units of 2^-14/1024
-		man := int32(math.Round(val))
-		if man <= 0 {
-			return sign
-		}
-		if man >= denom {
-			// Rounds up into the smallest normal.
-			return sign | (1 << manBits)
-		}
-		return sign | uint16(man)
-	}
-
-	manF := math.Round((m - 1) * denom)
-	if manF >= denom {
-		manF = 0
-		biasedExp++
-	}
-	if biasedExp >= 0x1F {
-		return sign | 0x7C00 // overflow -> Inf
-	}
-	return sign | uint16(biasedExp)<<manBits | uint16(manF)
-}
 
 func f16ToF32(bits uint16) float32 {
 	sign := bits >> 15
@@ -100,24 +75,19 @@ func f16ToF32(bits uint16) float32 {
 
 // ---------- bfloat16 ----------
 
-func f32ToBF16(f float32) uint16 {
-	bits := math.Float32bits(f)
-	if math.IsNaN(float64(f)) {
-		// Preserve NaN-ness; force a set mantissa bit so it can't decay to Inf.
-		return uint16(bits>>16) | 0x0040
-	}
-	// Round to nearest, ties to even.
-	roundBias := uint32(0x7FFF) + ((bits >> 16) & 1)
-	bits += roundBias
-	return uint16(bits >> 16)
-}
-
 func bf16ToF32(bits uint16) float32 {
 	return math.Float32frombits(uint32(bits) << 16)
 }
 
 // ---------- float8_e4m3fn ----------
 
+// f32ToF8E4M3 encodes f to e4m3fn with round-half-away-from-zero mantissa
+// rounding (deliberate; pinned by golden tests). It produces the same
+// layout as the PyTorch/ONNX e4m3fn, but at exact mantissa midpoints its
+// bytes differ from torch's RNE cast - f32ToE4M3RNE is the RNE variant,
+// used only for NVFP4 block scales. NaN and +/-Inf encode to the 0x7F
+// NaN pattern; magnitudes beyond 448 encode to 0x7F as well (e4m3fn has
+// no Inf), and tiny magnitudes flush to zero.
 func f32ToF8E4M3(f float32) uint8 {
 	sign := uint8(0)
 	if math.Signbit(float64(f)) {
@@ -127,6 +97,9 @@ func f32ToF8E4M3(f float32) uint8 {
 
 	if math.IsNaN(float64(f)) {
 		return sign | 0x7F
+	}
+	if math.IsInf(float64(f), 0) {
+		return sign | 0x7F // no Inf; saturate into the NaN pattern
 	}
 	if af == 0 {
 		return sign
@@ -370,7 +343,16 @@ func int8Scale(maxAbs float32) float32 {
 	return maxAbs / 127.0
 }
 
+// f32ToInt8 quantizes the f32 quotient f/scale to the nearest int8 in
+// [-127,127] using math.Round (half-away-from-zero). Edge behavior per the
+// file-header convention: NaN -> 0 (handled explicitly - the clamps below
+// are float comparisons that are false for NaN, and int8(NaN) is
+// implementation-defined per the Go spec), +Inf -> 127, -Inf -> -127,
+// scale == 0 -> 0.
 func f32ToInt8(f, scale float32) int8 {
+	if math.IsNaN(float64(f)) {
+		return 0
+	}
 	if scale == 0 {
 		return 0
 	}
@@ -382,10 +364,6 @@ func f32ToInt8(f, scale float32) int8 {
 		q = -127
 	}
 	return int8(q)
-}
-
-func int8ToF32(q int8, scale float32) float32 {
-	return float32(q) * scale
 }
 
 // ---------- int4 (symmetric, per-tensor scale, round-to-nearest-even) ----------
@@ -413,7 +391,10 @@ func int4Scale(maxAbs float32) float32 {
 //	frac > 0.5            -> q+1
 //	frac == 0.5 && q odd  -> q+1
 //
-// Edge behavior: NaN -> 0, +Inf -> 7, -Inf -> -7, scale == 0 -> 0.
+// Edge behavior: NaN -> 0, +Inf -> 7, -Inf -> -7, scale == 0 -> 0, and
+// magnitudes >= 7.5 clamp to 7 - clamped in float space before the integer
+// conversion, so out-of-int32-range quotients clamp too instead of
+// overflowing.
 func f32ToInt4RNE(f, scale float32) int8 {
 	if scale == 0 {
 		return 0
@@ -429,6 +410,17 @@ func f32ToInt4RNE(f, scale float32) int8 {
 	}
 	v := f / scale
 	av := math.Abs(float64(v))
+	// Clamp in float space before int32(av): the conversion is
+	// implementation-defined once av exceeds the int32 range, and the
+	// post-conversion q > 7 clamp below would never see the overflow.
+	// av < 8 keeps the int32 path in range; the q > 7 clamp still handles
+	// the 7.5 -> 8 RNE tie. Mirrors f32ToInt8's float-space clamping.
+	if !(av < 8) {
+		if math.Signbit(float64(f)) {
+			return -7
+		}
+		return 7
+	}
 	q := int32(av)
 	frac := av - float64(q)
 	switch {
@@ -446,16 +438,6 @@ func f32ToInt4RNE(f, scale float32) int8 {
 	return int8(q)
 }
 
-// int4ToF32 decodes a two's-complement int4 nibble (stored as v & 0x0F, so
-// nibble >= 8 is negative: value - 16) to f32 scaled by scale.
-func int4ToF32(nibble uint8, scale float32) float32 {
-	v := int32(nibble & 0x0F)
-	if v >= 8 {
-		v -= 16
-	}
-	return float32(v) * scale
-}
-
 // ---------- e2m1 (4-bit float, MXFP4/NVFP4 element format) ----------
 //
 // OCP 4-bit float: 1 sign | 2 exponent (bias 1) | 1 mantissa.
@@ -464,14 +446,6 @@ func int4ToF32(nibble uint8, scale float32) float32 {
 // Max magnitude is 6; all 16 patterns are finite (no Inf/NaN codes).
 
 var e2m1Grid = [8]float32{0, 0.5, 1, 1.5, 2, 3, 4, 6}
-
-func e2m1ToF32(bits uint8) float32 {
-	mag := e2m1Grid[bits&0x07]
-	if bits&0x08 != 0 {
-		mag = -mag
-	}
-	return mag
-}
 
 // f32ToE2M1 encodes f to the nearest e2m1 code using round-to-nearest-even.
 // The magnitude is compared against the 8 positive grid values; an exact
@@ -586,32 +560,37 @@ func e8m0Scale(code uint8) float32 {
 
 // ---------- shared 4-bit nibble packing (e2m1 and int4) ----------
 
-// packNibbles packs 4-bit values into bytes, two per byte, little-endian
-// element order: element 2i goes to the low nibble (bits 0-3) and element
-// 2i+1 to the high nibble (bits 4-7). An odd count pads a trailing zero
-// nibble, so the result is always (len(vals)+1)/2 bytes.
-func packNibbles(vals []uint8) []byte {
-	out := make([]byte, (len(vals)+1)/2)
+// packNibblesInto packs 4-bit values into the caller-provided dst and
+// returns the filled prefix, with the same layout packNibbles produces:
+// two values per byte, element 2i in the low nibble (bits 0-3) and
+// element 2i+1 in the high nibble (bits 4-7), an odd count padded with a
+// trailing zero nibble. dst must hold (len(vals)+1)/2 bytes; the streaming
+// passes reuse one such buffer per pass instead of allocating per block.
+// The used prefix is zeroed first so a reused dst cannot leak stale
+// nibbles from a previous pack (matters for odd-length packs, whose last
+// byte's high nibble is only the zero pad).
+func packNibblesInto(dst []byte, vals []uint8) []byte {
+	n := (len(vals) + 1) / 2
+	for i := 0; i < n; i++ {
+		dst[i] = 0
+	}
 	for i, v := range vals {
 		b := i / 2
 		if i%2 == 0 {
-			out[b] = v & 0x0F
+			dst[b] = v & 0x0F
 		} else {
-			out[b] |= (v & 0x0F) << 4
+			dst[b] |= (v & 0x0F) << 4
 		}
 	}
-	return out
+	return dst[:n]
 }
 
-// unpackNibbles is the inverse of packNibbles: each byte yields its low
-// nibble first, then its high nibble. (A trailing pad nibble from an odd
-// element count is returned as a zero value; the caller knows the true
-// element count.)
-func unpackNibbles(b []byte) []uint8 {
-	out := make([]uint8, len(b)*2)
-	for i, x := range b {
-		out[2*i] = x & 0x0F
-		out[2*i+1] = x >> 4
-	}
-	return out
+// packNibbles packs 4-bit values into bytes, two per byte, little-endian
+// element order: element 2i goes to the low nibble (bits 0-3) and element
+// 2i+1 to the high nibble (bits 4-7). An odd count pads a trailing zero
+// nibble, so the result is always (len(vals)+1)/2 bytes. The streaming
+// passes use packNibblesInto with a reused buffer; this wrapper remains
+// for one-shot callers (and the tests).
+func packNibbles(vals []uint8) []byte {
+	return packNibblesInto(make([]byte, (len(vals)+1)/2), vals)
 }

@@ -97,6 +97,13 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	for i := range cfg.Rules {
 		r := &cfg.Rules[i]
+		// A rule's "dtype" is explicit per-tensor intent, so an empty or
+		// missing value is a typo, not "none" - reject it here instead of
+		// letting ParseTargetKind's "" -> TargetNone leniency (which exists
+		// for the config default's "fall back to -target" meaning) apply.
+		if r.DType == "" {
+			return nil, fmt.Errorf("config rule %d: missing \"dtype\"", i)
+		}
 		if _, err := ParseTargetKind(r.DType); err != nil {
 			return nil, fmt.Errorf("config rule %d: %w", i, err)
 		}

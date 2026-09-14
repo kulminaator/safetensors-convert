@@ -3,6 +3,7 @@ package stconv
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -170,5 +171,61 @@ func TestLoadConfigRejectsUnknownDtype(t *testing.T) {
 	}
 	if _, err := LoadConfig(path); err == nil {
 		t.Error("LoadConfig: expected error for unknown dtype, got none")
+	}
+}
+
+// TestLoadConfigRejectsEmptyRuleDType pins the rule side of the empty-
+// dtype rule: a rule's "dtype" is explicit per-tensor intent, so a missing
+// or empty value must be a load error naming the rule index, not a silent
+// TargetNone (ParseTargetKind's "" leniency stays for the config default
+// only).
+func TestLoadConfigRejectsEmptyRuleDType(t *testing.T) {
+	cases := []struct {
+		name    string
+		json    string
+		wantIdx string // which rule index the error must name
+	}{
+		{"empty string dtype", `{"rules":[{"match":"w","dtype":""}]}`, "rule 0"},
+		{"missing dtype field", `{"rules":[{"pattern":"^a\\."}]}`, "rule 0"},
+		{"empty dtype on second rule", `{"rules":[{"match":"a","dtype":"int8"},{"match":"b","dtype":""}]}`, "rule 1"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.json")
+			if err := os.WriteFile(path, []byte(c.json), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			_, err := LoadConfig(path)
+			if err == nil {
+				t.Fatal("LoadConfig: expected error for empty rule dtype, got none")
+			}
+			if !strings.Contains(err.Error(), c.wantIdx) || !strings.Contains(err.Error(), `missing "dtype"`) {
+				t.Errorf("error %q does not name the rule index and the missing dtype", err)
+			}
+		})
+	}
+}
+
+// TestLoadConfigEmptyDefaultStillValid pins the other side of the same
+// rule: an absent or empty config "default" is legitimate (it means "fall
+// back to -target") and must keep loading fine.
+func TestLoadConfigEmptyDefaultStillValid(t *testing.T) {
+	for _, json := range []string{
+		`{"rules":[{"match":"w","dtype":"int8"}]}`,              // no default key
+		`{"default":"","rules":[{"match":"w","dtype":"int8"}]}`, // empty default
+		`{}`, // no default, no rules
+	} {
+		path := filepath.Join(t.TempDir(), "config.json")
+		if err := os.WriteFile(path, []byte(json), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := LoadConfig(path)
+		if err != nil {
+			t.Errorf("LoadConfig(%s): unexpected error: %v", json, err)
+			continue
+		}
+		if got, expl := cfg.TargetFor("other.weight", TargetFP8E4M3); got != TargetFP8E4M3 || expl {
+			t.Errorf("empty-default TargetFor(%q) = (%v, %v), want (TargetFP8E4M3, false)", "other.weight", got, expl)
+		}
 	}
 }

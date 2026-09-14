@@ -95,6 +95,13 @@ escape hatches:
   `warning: N protected tensor(s) converted by explicit config rules
   (see quantization-advice.md)`.
 
+The policy is best-effort name matching: the patterns are lowercase and
+segment-based, so e.g. an uppercase `LayerNorm` segment is not matched (the
+tensor gets converted) and a `denorm_*` name is over-matched (the tensor is
+kept); both directions are visible in the per-tensor report - a conversion
+or an `unchanged: default policy: ...` line - and `-no-protect`/config
+rules remain the escape hatches.
+
 ### Multi-file models
 
 `-in` also accepts a model directory of sharded `.safetensors` files: the
@@ -111,8 +118,10 @@ shard.
 is written as one shard per input shard (same filenames) plus a new
 `*.safetensors.index.json` whose `weight_map` mirrors the input's
 tensor-to-shard assignments. This requires a model-directory input, since
-the input's index drives the output layout, and a `-out` path that is an
-existing file is refused - the tool never overwrites in place.
+the input's index drives the output layout, and the tool never overwrites
+in place: a `-out` path that is an existing file is refused, and so is any
+planned shard filename or index name already present in the target
+directory - the run is refused up front, before anything is written.
 
 The output directory must exist beforehand - a missing `-out` path is a
 single-file output, not a directory to be created:
@@ -139,7 +148,15 @@ A few details worth knowing:
   `metadata.total_size` is the sum of the output shards' data byte lengths
   (including all scale-sibling bytes), derived from the conversion plan - the
   input's `total_size` describes the input and would be wrong for the
-  output.
+  output. Every other input index metadata key (`architectures` and
+  friends) is carried over unchanged; `total_size` is the only key the
+  output index overrides.
+- **A failed run leaves nothing behind.** If a run fails after its output
+  files were created (e.g. a read or write error mid-stream), the partially
+  written outputs are closed and removed - the single output file, or every
+  output shard plus the index if it was written - so a failed run never
+  leaves a truncated model on disk that looks loadable. Input files are
+  never touched.
 
 ## Per-layer control via config file
 
@@ -164,7 +181,8 @@ For "keep this layer at fp16, quantize that one," pass `-config`:
 - `default` is the target used for any tensor that no rule matches
   (falls back to `-target` on the command line if omitted).
 - `rules` are checked in order, first match wins. Each rule matches by
-  exact tensor `"match"` name or a regexp `"pattern"`.
+  exact tensor `"match"` name or a regexp `"pattern"` and requires an
+  explicit `"dtype"`.
 - `"dtype"` is one of `fp8_e4m3`, `fp8_e5m2`, `int8`, `int8_convrot`,
   `mxfp4`, `nvfp4`, `int4`, or `none` (leave the tensor exactly as it is in
   the output).
@@ -247,11 +265,16 @@ runs, and watch peak RSS stay flat (see Memory behavior above).
 - **fp8 (e4m3 / e5m2)**: values are cast directly, bit-for-bit per the OCP
   8-bit float spec (the same layouts as PyTorch's `torch.float8_e4m3fn` /
   `torch.float8_e5m2`, and ONNX's `Float8E4M3FN` / `Float8E5M2`). No
-  scaling is applied - fp8 has its own (small) dynamic range, so very
-  large or very small values will saturate or flush to zero. `e4m3` gives
-  more mantissa precision and a max magnitude of 448; `e5m2` gives more
-  exponent range (max magnitude 57344, supports Inf) at the cost of
-  precision.
+  scaling is applied. The mantissa is rounded half-away-from-zero - this
+  matches the PyTorch/ONNX *layouts* but not their cast *bytes* at exact
+  mantissa midpoints, where torch rounds to nearest-even (RNE);
+  `f32ToE4M3RNE` (used only for NVFP4 block scales) is the RNE variant.
+  `e4m3` gives more mantissa precision and a max magnitude of 448, but
+  has no Inf: magnitudes beyond 448 encode to `0x7F`, the e4m3fn NaN
+  pattern (a dequantizing loader reads NaN, not 448), and tiny magnitudes
+  flush to zero. `e5m2` gives more exponent range (max magnitude 57344,
+  supports Inf) at the cost of precision; its overflow encodes to +/-Inf,
+  which stays accurate.
 - **int8**: quantized per-tensor, symmetric, using
   `scale = max(abs(tensor)) / 127`, `q = round(x / scale)` clamped to
   `[-127, 127]`. Since int8 has no implicit scale, a small sibling scalar
@@ -336,16 +359,26 @@ runs, and watch peak RSS stay flat (see Memory behavior above).
   `single256` writes one BF16 [2,128] tensor with a strong outlier
   (256 elements - a ConvRot rotation group), `multirot` writes a
   2-shard model directory of 256-element tensors (one [128,2] so
-  rotation groups straddle rows), and `qwenlike` writes one BF16 file
-  whose tensor names follow the bundled Qwen models' naming (embedding,
+  rotation groups straddle rows), `qwenlike` writes one BF16 file whose
+  tensor names follow the bundled Qwen models' naming (embedding,
   layernorms, q/k/v/o_proj, q/k_norm, mlp projections, final norm,
   lm_head, plus an I32 buffer) - the fixture for the default-precision-
-  policy e2e test. The generated fixtures are committed under
+  policy e2e test, and `empty` writes one BF16 file whose header order
+  is a zero-element [0,8] tensor, a 256-element tensor (a ConvRot
+  rotation group), a zero-element [0] tensor, and a 16-element tensor
+  (not a 256-multiple) - the fixture for the zero-element convrot
+  regression test. The generated fixtures are committed under
   `testdata/single`, `testdata/multi`, `testdata/single256`,
-  `testdata/multirot`, and `testdata/qwenlike`.
+  `testdata/multirot`, `testdata/qwenlike`, and `testdata/empty`.
 
 ## Known limitations / next steps
 
+- Unify fp8 rounding on RNE with a golden refresh - deliberately not done
+  in the review-fix round. The `fp8_e4m3`/`fp8_e5m2` casts round the
+  mantissa half-away-from-zero; switching them to round-to-nearest-even
+  (matching torch's cast bytes at exact mantissa midpoints) is a behavior
+  change that requires regenerating the fp8 golden tests, so it is
+  deferred as an explicit decision (see How conversion works).
 - int8 scale is a single scalar per tensor (no per-channel/group-wise
   quantization yet) - per-channel scales would meaningfully improve
   accuracy for weights with outlier channels and would be the natural

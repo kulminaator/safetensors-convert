@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"os"
@@ -364,6 +365,141 @@ func TestConvertConvRotDeterministic(t *testing.T) {
 	}
 	if !bytes.Equal(out1, out2) {
 		t.Fatalf("two conversions of the same input differ (%d vs %d bytes)", len(out1), len(out2))
+	}
+}
+
+// countingReaderAt wraps an io.ReaderAt, counting ReadAt calls and bytes
+// and tracking the farthest byte offset read (to assert reads stay within
+// the tensor).
+type countingReaderAt struct {
+	r      io.ReaderAt
+	calls  int
+	bytes  int64
+	maxEnd int64
+}
+
+func (c *countingReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	n, err := c.r.ReadAt(p, off)
+	c.calls++
+	c.bytes += int64(n)
+	if end := off + int64(n); end > c.maxEnd {
+		c.maxEnd = end
+	}
+	return n, err
+}
+
+// runConvRot runs streamConvRot over vals (presented as an F32 source
+// with the given shape) and returns the written bytes (the row scales,
+// then the rotated I8 data) and the counting reader.
+func runConvRot(t *testing.T, vals []float32, shape []int64, chunkElems int) ([]byte, *countingReaderAt) {
+	t.Helper()
+	cr := &countingReaderAt{r: bytes.NewReader(f32ToBytes(vals))}
+	var w bytes.Buffer
+	if _, err := streamConvRot(cr, &w, 0, DTypeF32, shape, int64(len(vals)), chunkElems); err != nil {
+		t.Fatalf("streamConvRot: %v", err)
+	}
+	return w.Bytes(), cr
+}
+
+// TestStreamConvRotWindowedReads pins the chunkElems-driven read window
+// of streamConvRot: (a) the output bytes are identical for every window
+// size - the window changes how the source is read, never what is
+// computed - and match the reference (per-group Hadamard, per-row scale
+// = rowMax/127 over the rotated values, f32ToInt8 quantization) byte for
+// byte; (b) the ReadAt call count drops from one per group visit (3
+// sweeps x G groups) to O(G/window) per sweep; (c) no read crosses the
+// tensor's end (the window is clamped to numElems).
+func TestStreamConvRotWindowedReads(t *testing.T) {
+	rnd := rand.New(rand.NewSource(4242))
+	const groups = 6 // 1536 elements
+	vals := make([]float32, groups*convrotGroup)
+	for i := range vals {
+		vals[i] = float32(rnd.Float64()*2 - 1)
+	}
+	vals[1000] = 33.0 // outlier so row scales are non-trivial
+	// Shape [12, 128]: rows of 128 elements, so each 256-element group
+	// straddles two rows (exercises pass 1's per-element row tracking
+	// and pass 2/3's multi-group-per-row ranges).
+	shape := []int64{12, 128}
+	const c = int64(128) // row width
+	rows := int64(len(vals)) / c
+
+	// Reference: rotate every group in place, then per row take the max
+	// |v| over the rotated values (scale = rowMax/127) and quantize.
+	rot := append([]float32(nil), vals...)
+	for g := 0; g < groups; g++ {
+		hadamard256(rot[g*convrotGroup : (g+1)*convrotGroup])
+	}
+	want := make([]byte, 4*int(rows)+len(vals))
+	for rr := int64(0); rr < rows; rr++ {
+		var m float32
+		for j := rr * c; j < (rr+1)*c; j++ {
+			v := rot[j]
+			if v < 0 {
+				v = -v
+			}
+			if v > m {
+				m = v
+			}
+		}
+		scale := int8Scale(m)
+		binary.LittleEndian.PutUint32(want[rr*4:], math.Float32bits(scale))
+		for j := rr * c; j < (rr+1)*c; j++ {
+			want[4*rows+j] = byte(f32ToInt8(rot[j], scale))
+		}
+	}
+
+	// (a) Byte identity across window sizes, against the reference.
+	outSmall, rSmall := runConvRot(t, vals, shape, 256) // window = 1 group
+	outMid, rMid := runConvRot(t, vals, shape, 1024)    // window = 4 groups
+	outBig, rBig := runConvRot(t, vals, shape, 1<<20)   // window > tensor
+	if !bytes.Equal(outMid, want) {
+		t.Fatalf("window=1024 output differs from reference (%d vs %d bytes)", len(outMid), len(want))
+	}
+	if !bytes.Equal(outSmall, outMid) || !bytes.Equal(outBig, outMid) {
+		t.Fatalf("outputs differ across window sizes (small=%d mid=%d big=%d bytes)",
+			len(outSmall), len(outMid), len(outBig))
+	}
+
+	// (c) No read crosses the tensor's end (1536 f32 elements = 6144
+	// bytes).
+	tensorBytes := int64(len(vals)) * 4
+	for name, cr := range map[string]*countingReaderAt{
+		"window=256": rSmall, "window=1024": rMid, "window=2^20": rBig,
+	} {
+		if cr.maxEnd > tensorBytes {
+			t.Errorf("%s: read reached byte %d, past the tensor end %d", name, cr.maxEnd, tensorBytes)
+		}
+	}
+
+	// (b) ReadAt counts: the un-windowed code issues one ReadAt per
+	// group visit (6 pass-1 visits + 12 rows x 2 visits = 30, for any
+	// chunkElems). With a 1-group window, re-visits of the same group
+	// (a row's rescan->quantize pair, and the two rows sharing each
+	// straddled group) are served from the window, so each pass reads
+	// each group exactly once (6 + 6); a 4-group window covers most of
+	// the tensor per read; a window bigger than the tensor is served by
+	// a single whole-tensor read shared by all three sweeps.
+	if rSmall.calls != 12 {
+		t.Errorf("window=256: %d ReadAt calls, want 12 (6 groups x 2 passes)", rSmall.calls)
+	}
+	if rSmall.bytes != 12288 {
+		t.Errorf("window=256: %d bytes read, want 12288", rSmall.bytes)
+	}
+	// window=1024: pass 1 reads [0,4) and [4,6); passes 2/3 read [0,4)
+	// for rows 0-7 and [4,6) for rows 8-11 -> 4 reads of
+	// 4096/2048/4096/2048 bytes.
+	if rMid.calls != 4 {
+		t.Errorf("window=1024: %d ReadAt calls, want 4", rMid.calls)
+	}
+	if rMid.bytes != 12288 {
+		t.Errorf("window=1024: %d bytes read, want 12288", rMid.bytes)
+	}
+	if rBig.calls != 1 {
+		t.Errorf("window=2^20: %d ReadAt calls, want 1 (whole tensor, shared by all sweeps)", rBig.calls)
+	}
+	if rBig.bytes != 6144 {
+		t.Errorf("window=2^20: %d bytes read, want 6144", rBig.bytes)
 	}
 }
 

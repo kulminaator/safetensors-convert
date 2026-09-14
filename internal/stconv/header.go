@@ -72,6 +72,9 @@ func ReadHeader(r io.ReadSeeker) (*Header, int64, error) {
 	if err := binary.Read(r, binary.LittleEndian, &headerLen); err != nil {
 		return nil, 0, fmt.Errorf("reading header length: %w", err)
 	}
+	// The 1<<32 upper bound is a sanity check against corrupt input, not a
+	// memory limit: headers are metadata, bounded by tensor count, and the
+	// full header is materialized in memory by design.
 	if headerLen == 0 || headerLen > 1<<32 {
 		return nil, 0, fmt.Errorf("implausible header length %d", headerLen)
 	}
