@@ -8,6 +8,7 @@
 //	go run ./testdata/gen multi <outDir>     // 2-shard model dir + index JSON
 //	go run ./testdata/gen single256 <outFile> // one BF16 [2,128] tensor (256 elems, outlier)
 //	go run ./testdata/gen multirot <outDir>   // 2-shard model dir with 256-elem tensors
+//	go run ./testdata/gen qwenlike <outFile>  // one BF16 file named like a small Qwen model
 //
 // Tensor values are fixed below so tests can spot-check converted output
 // against known inputs.
@@ -271,6 +272,43 @@ func writeSingle256(outPath string) {
 	writeSafetensors(outPath, []fixtureTensor{rotWeightTensor()}, false)
 }
 
+// qwenLikeTensor is a small BF16 tensor with a deterministic value
+// pattern (0.05*(i%7-3), range [-0.15, 0.15]); n is the element count.
+// The e2e tests assert dtypes and passthrough byte identity, not
+// converted values, so the pattern just needs to be fixed and non-zero.
+func qwenLikeTensor(name, shape string, n int) fixtureTensor {
+	vals := make([]float32, n)
+	for i := range vals {
+		vals[i] = 0.05 * float32(i%7-3)
+	}
+	return fixtureTensor{name: name, dtype: "BF16", shape: shape, data: packBF16(vals...)}
+}
+
+// writeQwenLike writes a single-shard file whose tensor names follow the
+// bundled Qwen models' naming (embedding, layernorms, q/k/v/o_proj,
+// q/k_norm, mlp projections, final norm, lm_head) plus one I32 buffer to
+// keep exercising the non-float passthrough. It is the fixture for the
+// default-precision-policy e2e test.
+func writeQwenLike(outPath string) {
+	writeSafetensors(outPath, []fixtureTensor{
+		qwenLikeTensor("model.embed_tokens.weight", "[64,32]", 64*32),
+		qwenLikeTensor("model.layers.0.input_layernorm.weight", "[32]", 32),
+		qwenLikeTensor("model.layers.0.self_attn.q_proj.weight", "[32,16]", 32*16),
+		qwenLikeTensor("model.layers.0.self_attn.k_proj.weight", "[32,16]", 32*16),
+		qwenLikeTensor("model.layers.0.self_attn.v_proj.weight", "[32,16]", 32*16),
+		qwenLikeTensor("model.layers.0.self_attn.o_proj.weight", "[32,16]", 32*16),
+		qwenLikeTensor("model.layers.0.self_attn.q_norm.weight", "[32]", 32),
+		qwenLikeTensor("model.layers.0.self_attn.k_norm.weight", "[32]", 32),
+		qwenLikeTensor("model.layers.0.mlp.gate_proj.weight", "[32,16]", 32*16),
+		qwenLikeTensor("model.layers.0.mlp.up_proj.weight", "[32,16]", 32*16),
+		qwenLikeTensor("model.layers.0.mlp.down_proj.weight", "[16,32]", 16*32),
+		qwenLikeTensor("model.layers.0.post_attention_layernorm.weight", "[32]", 32),
+		qwenLikeTensor("model.norm.weight", "[32]", 32),
+		qwenLikeTensor("lm_head.weight", "[16,8]", 16*8),
+		{name: "model.layers.0.mlp.position_ids", dtype: "I32", shape: "[4]", data: packI32(0, 1, 2, 3)},
+	}, false)
+}
+
 // writeMultiRot writes a 2-shard model directory whose tensors are
 // 256-element multiples (for the ConvRot e2e tests): shard 1 holds
 // rot.a (BF16 [128,2], rotation groups straddle rows), shard 2 holds
@@ -364,7 +402,7 @@ func writeIndex(path string, shards []shard, totalSize int) {
 
 func main() {
 	if len(os.Args) != 3 {
-		fmt.Fprintln(os.Stderr, "usage: gen single <outFile> | gen multi <outDir> | gen single256 <outFile> | gen multirot <outDir>")
+		fmt.Fprintln(os.Stderr, "usage: gen single <outFile> | gen multi <outDir> | gen single256 <outFile> | gen multirot <outDir> | gen qwenlike <outFile>")
 		os.Exit(1)
 	}
 	switch os.Args[1] {
@@ -376,6 +414,8 @@ func main() {
 		writeSingle256(os.Args[2])
 	case "multirot":
 		writeMultiRot(os.Args[2])
+	case "qwenlike":
+		writeQwenLike(os.Args[2])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown mode %q\n", os.Args[1])
 		os.Exit(1)

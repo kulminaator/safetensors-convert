@@ -297,11 +297,15 @@ runs, and watch peak RSS stay flat (see Memory behavior above).
   one 3-tensor file, `multi` writes a 2-shard model directory with an
   index (shard 2 carries an I32 buffer to exercise passthrough),
   `single256` writes one BF16 [2,128] tensor with a strong outlier
-  (256 elements - a ConvRot rotation group), and `multirot` writes a
+  (256 elements - a ConvRot rotation group), `multirot` writes a
   2-shard model directory of 256-element tensors (one [128,2] so
-  rotation groups straddle rows). The generated fixtures are committed
-  under `testdata/single`, `testdata/multi`, `testdata/single256`, and
-  `testdata/multirot`.
+  rotation groups straddle rows), and `qwenlike` writes one BF16 file
+  whose tensor names follow the bundled Qwen models' naming (embedding,
+  layernorms, q/k/v/o_proj, q/k_norm, mlp projections, final norm,
+  lm_head, plus an I32 buffer) - the fixture for the default-precision-
+  policy e2e test. The generated fixtures are committed under
+  `testdata/single`, `testdata/multi`, `testdata/single256`,
+  `testdata/multirot`, and `testdata/qwenlike`.
 
 ## Known limitations / next steps
 

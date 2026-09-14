@@ -635,6 +635,78 @@ func TestConvertSingleNoProtectRestoresBlanketConversion(t *testing.T) {
 	}
 }
 
+// TestConvertQwenLikeDefaultFP8Policy is the end-to-end test for the
+// default precision policy (Steps 1+3+4 together): the qwenlike fixture
+// carries realistic names for every protected category, and a default
+// fp8 run with protection on must keep them all at BF16 with the right
+// reason while converting only the MLP projections. It fails without
+// the policy: unprotected, every BF16 tensor would become F8_E4M3.
+func TestConvertQwenLikeDefaultFP8Policy(t *testing.T) {
+	in := filepath.Join("../../testdata/qwenlike", "qwenlike.safetensors")
+	out := filepath.Join(t.TempDir(), "out.safetensors")
+	stats, err := ConvertFile(ConvertOptions{
+		InputPath:  in,
+		OutputPath: out,
+		Default:    TargetFP8E4M3,
+		Protect:    true,
+	})
+	if err != nil {
+		t.Fatalf("ConvertFile: %v", err)
+	}
+
+	// Full expected outcome table, in input tensor order.
+	want := []struct {
+		name  string
+		dtype DType
+		skip  string
+	}{
+		{"model.embed_tokens.weight", DTypeBF16, protectReasonEmbeddings},
+		{"model.layers.0.input_layernorm.weight", DTypeBF16, protectReasonNorms},
+		{"model.layers.0.self_attn.q_proj.weight", DTypeBF16, protectReasonAttnProj},
+		{"model.layers.0.self_attn.k_proj.weight", DTypeBF16, protectReasonAttnProj},
+		{"model.layers.0.self_attn.v_proj.weight", DTypeBF16, protectReasonAttnProj},
+		{"model.layers.0.self_attn.o_proj.weight", DTypeBF16, protectReasonAttnProj},
+		{"model.layers.0.self_attn.q_norm.weight", DTypeBF16, protectReasonNorms},
+		{"model.layers.0.self_attn.k_norm.weight", DTypeBF16, protectReasonNorms},
+		{"model.layers.0.mlp.gate_proj.weight", DTypeF8E4M3, ""},
+		{"model.layers.0.mlp.up_proj.weight", DTypeF8E4M3, ""},
+		{"model.layers.0.mlp.down_proj.weight", DTypeF8E4M3, ""},
+		{"model.layers.0.post_attention_layernorm.weight", DTypeBF16, protectReasonNorms},
+		{"model.norm.weight", DTypeBF16, protectReasonNorms},
+		{"lm_head.weight", DTypeBF16, protectReasonLMHead},
+		{"model.layers.0.mlp.position_ids", DTypeI32, "non-float dtype, copied as-is"},
+	}
+	if len(stats) != len(want) {
+		t.Fatalf("got %d stats, want %d", len(stats), len(want))
+	}
+	for i, w := range want {
+		s := stats[i]
+		if s.Name != w.name {
+			t.Errorf("stat[%d].Name = %q, want %q", i, s.Name, w.name)
+			continue
+		}
+		if s.ToDType != w.dtype {
+			t.Errorf("stat (%s).ToDType = %s, want %s", s.Name, s.ToDType, w.dtype)
+		}
+		if s.SkippedWhy != w.skip {
+			t.Errorf("stat (%s).SkippedWhy = %q, want %q", s.Name, s.SkippedWhy, w.skip)
+		}
+		if w.skip != "" && s.ToDType != s.FromDType {
+			t.Errorf("stat (%s): kept tensor changed dtype %s -> %s, want passthrough", s.Name, s.FromDType, s.ToDType)
+		}
+	}
+
+	// Passthrough tensors are byte-identical to the input's bytes.
+	for _, s := range stats {
+		if s.SkippedWhy == "" {
+			continue
+		}
+		if !bytes.Equal(readTensorBytes(t, in, s.Name), readTensorBytes(t, out, s.Name)) {
+			t.Errorf("tensor %s: passthrough bytes differ from input", s.Name)
+		}
+	}
+}
+
 func TestPlanModelInt8ScaleFollowsOwner(t *testing.T) {
 	cfg := &Config{
 		Rules: []ConfigRule{{Match: nameNorm, DType: "int8"}},
