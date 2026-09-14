@@ -72,9 +72,55 @@ func TestLoadConfigTargetForNewDtypes(t *testing.T) {
 		{"other.weight", TargetInt4}, // default
 	}
 	for _, c := range cases {
-		if got := cfg.TargetFor(c.name, TargetFP8E4M3); got != c.want {
+		if got, _ := cfg.TargetFor(c.name, TargetFP8E4M3); got != c.want {
 			t.Errorf("TargetFor(%q) = %v, want %v", c.name, got, c.want)
 		}
+	}
+}
+
+func TestTargetForExplicitness(t *testing.T) {
+	// A rule match (exact or pattern) is explicit per-tensor intent;
+	// the config default and the fallback are bulk defaults and must
+	// not be reported as explicit.
+	cfgJSON := `{
+		"default": "int4",
+		"rules": [
+			{ "match": "model.norm.weight", "dtype": "int8" },
+			{ "pattern": "^skip\\.", "dtype": "none" }
+		]
+	}`
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(cfgJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	cases := []struct {
+		name     string
+		want     TargetKind
+		wantExpl bool
+	}{
+		{"model.norm.weight", TargetInt8, true}, // exact match rule
+		{"skip.x", TargetNone, true},            // pattern rule
+		{"other.weight", TargetInt4, false},     // config default
+	}
+	for _, c := range cases {
+		got, expl := cfg.TargetFor(c.name, TargetFP8E4M3)
+		if got != c.want || expl != c.wantExpl {
+			t.Errorf("TargetFor(%q) = (%v, %v), want (%v, %v)", c.name, got, expl, c.want, c.wantExpl)
+		}
+	}
+	// Rules but no default: unmatched tensors fall back, never explicit.
+	noDefault := &Config{Rules: cfg.Rules}
+	if got, expl := noDefault.TargetFor("other.weight", TargetFP8E4M3); got != TargetFP8E4M3 || expl {
+		t.Errorf("no-default TargetFor = (%v, %v), want (TargetFP8E4M3, false)", got, expl)
+	}
+	// No config at all: the fallback is never explicit either.
+	empty := &Config{}
+	if got, expl := empty.TargetFor("anything", TargetFP8E4M3); got != TargetFP8E4M3 || expl {
+		t.Errorf("empty config TargetFor = (%v, %v), want (TargetFP8E4M3, false)", got, expl)
 	}
 }
 

@@ -420,7 +420,8 @@ func planTensor(opts ConvertOptions, name string, info TensorInfo, srcShard int,
 
 	target := opts.Default
 	if opts.Config != nil {
-		target = opts.Config.TargetFor(name, opts.Default)
+		// The explicit-match flag is consumed by the protection policy (see protect.go).
+		target, _ = opts.Config.TargetFor(name, opts.Default)
 	}
 
 	switch {

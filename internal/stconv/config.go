@@ -116,21 +116,24 @@ func LoadConfig(path string) (*Config, error) {
 
 // TargetFor resolves the conversion target for a given tensor name: first
 // matching rule wins, in file order; falls back to the config's default,
-// or to fallbackDefault if the config has none set.
-func (c *Config) TargetFor(tensorName string, fallbackDefault TargetKind) TargetKind {
+// or to fallbackDefault if the config has none set. The second return
+// value reports whether a rule actually matched: the config default and
+// fallbackDefault are bulk defaults, not explicit per-tensor intent, so
+// built-in policy (e.g. tensor protection) must not yield to them.
+func (c *Config) TargetFor(tensorName string, fallbackDefault TargetKind) (TargetKind, bool) {
 	for _, r := range c.Rules {
 		if r.Match != "" && r.Match == tensorName {
 			k, _ := ParseTargetKind(r.DType)
-			return k
+			return k, true
 		}
 		if r.compiled != nil && r.compiled.MatchString(tensorName) {
 			k, _ := ParseTargetKind(r.DType)
-			return k
+			return k, true
 		}
 	}
 	if c.Default != "" {
 		k, _ := ParseTargetKind(c.Default)
-		return k
+		return k, false
 	}
-	return fallbackDefault
+	return fallbackDefault, false
 }
