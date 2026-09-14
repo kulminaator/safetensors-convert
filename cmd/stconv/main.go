@@ -106,6 +106,19 @@ func run() error {
 	if !*quiet {
 		printReport(stats)
 	}
+
+	// An explicit config rule may override the default protection policy
+	// (quantization-advice.md: honor the request, but warn). One line on
+	// stderr, after the report, only when something was overridden.
+	overridden := 0
+	for _, s := range stats {
+		if s.ProtectOverride {
+			overridden++
+		}
+	}
+	if overridden > 0 {
+		fmt.Fprintf(os.Stderr, "warning: %d protected tensor(s) converted by explicit config rules (see quantization-advice.md)\n", overridden)
+	}
 	return nil
 }
 

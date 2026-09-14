@@ -124,6 +124,45 @@ func TestTargetForExplicitness(t *testing.T) {
 	}
 }
 
+// TestTargetForExplicitnessVsProtection re-verifies Step 2's
+// explicit/implicit semantics end to end for protected names: only
+// implicit resolutions (config default, fallback) are subject to the
+// default protection policy; an explicit rule match is per-tensor user
+// intent and always wins. This is the contract planTensor's protection
+// check (and its override warning) relies on.
+func TestTargetForExplicitnessVsProtection(t *testing.T) {
+	cfg := &Config{
+		Default: "fp8_e4m3",
+		Rules:   []ConfigRule{{Match: "model.layers.0.input_layernorm.weight", DType: "int8"}},
+	}
+	cases := []struct {
+		name          string
+		wantTarget    TargetKind
+		wantExplicit  bool
+		wantProtected bool // whether planTensor would keep the tensor at its original dtype
+	}{
+		{"model.layers.0.input_layernorm.weight", TargetInt8, true, false},    // explicit rule wins
+		{"model.layers.1.input_layernorm.weight", TargetFP8E4M3, false, true}, // config default, protected name
+		{"model.layers.1.mlp.gate_proj.weight", TargetFP8E4M3, false, false},  // config default, unprotected name
+	}
+	for _, c := range cases {
+		target, explicit := cfg.TargetFor(c.name, TargetFP8E4M3)
+		if target != c.wantTarget || explicit != c.wantExplicit {
+			t.Errorf("TargetFor(%q) = (%v, %v), want (%v, %v)", c.name, target, explicit, c.wantTarget, c.wantExplicit)
+			continue
+		}
+		// Mirror of planTensor's decision: protection applies only to
+		// non-explicit targets.
+		protected := false
+		if !explicit {
+			protected, _ = ProtectDefault(c.name, target)
+		}
+		if protected != c.wantProtected {
+			t.Errorf("protection applies to %q = %v, want %v", c.name, protected, c.wantProtected)
+		}
+	}
+}
+
 func TestLoadConfigRejectsUnknownDtype(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, []byte(`{"rules":[{"match":"w","dtype":"int5"}]}`), 0o644); err != nil {

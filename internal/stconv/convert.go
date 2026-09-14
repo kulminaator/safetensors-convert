@@ -46,6 +46,10 @@ type TensorStat struct {
 	Scale      float32 // only meaningful for int8
 	Note       string  // optional extra shown in the report when non-empty (e.g. convrot row count, nvfp4 global scale)
 	SkippedWhy string  // non-empty if the tensor was left unconverted
+	// ProtectOverride is true when an explicit config rule converted a
+	// tensor the default policy would have protected. Not shown in the
+	// report; the CLI counts these and prints a one-line stderr warning.
+	ProtectOverride bool
 }
 
 // tensorPlan is decided entirely from the input header (dtype + shape),
@@ -54,20 +58,21 @@ type TensorStat struct {
 // up front, which is what lets us write the header once and then stream
 // data straight through in file order.
 type tensorPlan struct {
-	name          string
-	srcShard      int               // index into ConvertOptions.InputShards; srcAbsOffset is relative to that shard file
-	srcName       string            // input shard filename (basename); multi-file output keeps it as the output shard name
-	srcMetadata   map[string]string // input shard's __metadata__ block (nil if none); shared by all plans from that shard
-	srcInfo       TensorInfo
-	srcAbsOffset  int64 // absolute offset of source tensor bytes in its source shard file
-	srcLen        int64 // source tensor byte length
-	numElems      int64
-	target        TargetKind
-	outDType      DType
-	outLen        int64  // planned output byte length of this tensor (sibling tensors not included)
-	protectReason string // non-empty => the passthrough came from the default protection policy, not from config/default or a mechanical constraint
-	skippedWhy    string // non-empty => passthrough copy, no conversion
-	sibs          []sib  // sibling tensors this plan emits (nil for passthrough)
+	name            string
+	srcShard        int               // index into ConvertOptions.InputShards; srcAbsOffset is relative to that shard file
+	srcName         string            // input shard filename (basename); multi-file output keeps it as the output shard name
+	srcMetadata     map[string]string // input shard's __metadata__ block (nil if none); shared by all plans from that shard
+	srcInfo         TensorInfo
+	srcAbsOffset    int64 // absolute offset of source tensor bytes in its source shard file
+	srcLen          int64 // source tensor byte length
+	numElems        int64
+	target          TargetKind
+	outDType        DType
+	outLen          int64  // planned output byte length of this tensor (sibling tensors not included)
+	protectReason   string // non-empty => the passthrough came from the default protection policy, not from config/default or a mechanical constraint
+	protectOverride bool   // explicit config rule converted a tensor the policy would protect; surfaced in TensorStat for the CLI warning
+	skippedWhy      string // non-empty => passthrough copy, no conversion
+	sibs            []sib  // sibling tensors this plan emits (nil for passthrough)
 }
 
 // sib is one sibling tensor emitted alongside a converted tensor's owner.
@@ -462,6 +467,13 @@ func planTensor(opts ConvertOptions, name string, info TensorInfo, srcShard int,
 		plan.skippedWhy = "not a multiple of 256 (rotation group size)"
 	default:
 		plan.target = target
+		// An explicit rule converting a protected tensor wins over the
+		// policy (quantization-advice.md: honor the request, but warn).
+		// Only tensors actually converted are flagged - a rule that keeps
+		// a protected name at its original dtype overrides nothing.
+		if opts.Protect && explicit {
+			plan.protectOverride, _ = ProtectDefault(name, target)
+		}
 		switch target {
 		case TargetFP8E4M3:
 			plan.outDType = DTypeF8E4M3
@@ -515,7 +527,7 @@ func planTensor(opts ConvertOptions, name string, info TensorInfo, srcShard int,
 // file, already open by the caller - to w, reading from the plan's
 // shard-relative offset.
 func convertTensor(p tensorPlan, src io.ReaderAt, w io.Writer, chunkElems int) (TensorStat, error) {
-	stat := TensorStat{Name: p.name, FromDType: p.srcInfo.DType, ToDType: p.outDType, NumElems: p.numElems}
+	stat := TensorStat{Name: p.name, FromDType: p.srcInfo.DType, ToDType: p.outDType, NumElems: p.numElems, ProtectOverride: p.protectOverride}
 
 	if p.skippedWhy != "" {
 		stat.SkippedWhy = p.skippedWhy

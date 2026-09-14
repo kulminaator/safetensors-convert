@@ -448,6 +448,162 @@ func TestConvertSingleAttnProjFP8OnlyProtection(t *testing.T) {
 	}
 }
 
+// TestConvertSingleExplicitRuleOverridesProtection pins that an explicit
+// config rule wins over the protection policy and is flagged for the CLI
+// warning: a rule forcing int8 on the norm tensor converts it (with its
+// .scale sibling) instead of protecting it, and a rule forcing fp8 on
+// q_proj likewise overrides the fp8-only rule. A rule that merely keeps
+// a protected name at its original dtype overrides nothing and is not
+// counted.
+func TestConvertSingleExplicitRuleOverridesProtection(t *testing.T) {
+	countOverrides := func(stats []TensorStat) int {
+		n := 0
+		for _, s := range stats {
+			if s.ProtectOverride {
+				n++
+			}
+		}
+		return n
+	}
+
+	t.Run("rule int8 on norm tensor", func(t *testing.T) {
+		cfg := &Config{Rules: []ConfigRule{{Match: nameNorm, DType: "int8"}}}
+		out := filepath.Join(t.TempDir(), "out.safetensors")
+		stats, err := ConvertFile(ConvertOptions{
+			InputPath:  singleFixturePath,
+			OutputPath: out,
+			Config:     cfg,
+			Default:    TargetFP8E4M3,
+			Protect:    true,
+		})
+		if err != nil {
+			t.Fatalf("ConvertFile: %v", err)
+		}
+
+		f, err := os.Open(out)
+		if err != nil {
+			t.Fatalf("opening output: %v", err)
+		}
+		defer f.Close()
+		outHeader, _, err := ReadHeader(f)
+		if err != nil {
+			t.Fatalf("reading output header: %v", err)
+		}
+		// Explicit rule converts the norm (I8 + .scale after the owner);
+		// q_proj has no rule, so the fp8 protection still applies to it.
+		checkOutHeader(t, outHeader, []outEntry{
+			{nameUpProj, DTypeF8E4M3, [2]int64{0, 8}},
+			{nameQProj, DTypeF16, [2]int64{8, 16}},
+			{nameNorm, DTypeI8, [2]int64{16, 20}},
+			{nameNorm + ".scale", DTypeF32, [2]int64{20, 24}},
+		})
+
+		want := map[string]struct {
+			toDType  DType
+			override bool
+			skip     string
+		}{
+			nameUpProj: {DTypeF8E4M3, false, ""},
+			nameQProj:  {DTypeF16, false, protectReasonAttnProj},
+			nameNorm:   {DTypeI8, true, ""},
+		}
+		for _, s := range stats {
+			w, ok := want[s.Name]
+			if !ok {
+				t.Fatalf("unexpected stat for %q", s.Name)
+			}
+			if s.ToDType != w.toDType || s.ProtectOverride != w.override || s.SkippedWhy != w.skip {
+				t.Errorf("stat (%s) = (ToDType %s, override %v, skip %q), want (%s, %v, %q)",
+					s.Name, s.ToDType, s.ProtectOverride, s.SkippedWhy, w.toDType, w.override, w.skip)
+			}
+		}
+		// The norm is all 1.0 in the fixture -> int8 scale 1.0/127.
+		var norm *TensorStat
+		for i := range stats {
+			if stats[i].Name == nameNorm {
+				norm = &stats[i]
+			}
+		}
+		if norm.Scale != 1.0/127 {
+			t.Errorf("norm int8 scale = %v, want %v", norm.Scale, 1.0/127)
+		}
+		if n := countOverrides(stats); n != 1 {
+			t.Errorf("override count = %d, want 1 (only the norm)", n)
+		}
+	})
+
+	t.Run("rule fp8 on q_proj overrides the fp8-only rule", func(t *testing.T) {
+		cfg := &Config{Rules: []ConfigRule{{Match: nameQProj, DType: "fp8_e4m3"}}}
+		out := filepath.Join(t.TempDir(), "out.safetensors")
+		stats, err := ConvertFile(ConvertOptions{
+			InputPath:  singleFixturePath,
+			OutputPath: out,
+			Config:     cfg,
+			Default:    TargetFP8E4M3,
+			Protect:    true,
+		})
+		if err != nil {
+			t.Fatalf("ConvertFile: %v", err)
+		}
+
+		f, err := os.Open(out)
+		if err != nil {
+			t.Fatalf("opening output: %v", err)
+		}
+		defer f.Close()
+		outHeader, _, err := ReadHeader(f)
+		if err != nil {
+			t.Fatalf("reading output header: %v", err)
+		}
+		// q_proj is converted by the explicit rule; the norm has no rule,
+		// so the hard protection still applies to it.
+		checkOutHeader(t, outHeader, []outEntry{
+			{nameUpProj, DTypeF8E4M3, [2]int64{0, 8}},
+			{nameQProj, DTypeF8E4M3, [2]int64{8, 12}},
+			{nameNorm, DTypeF16, [2]int64{12, 20}},
+		})
+
+		for _, s := range stats {
+			wantOverride := s.Name == nameQProj
+			if s.ProtectOverride != wantOverride {
+				t.Errorf("stat (%s).ProtectOverride = %v, want %v", s.Name, s.ProtectOverride, wantOverride)
+			}
+			if s.Name == nameNorm && s.SkippedWhy != protectReasonNorms {
+				t.Errorf("stat (%s).SkippedWhy = %q, want the norm protection reason", s.Name, s.SkippedWhy)
+			}
+		}
+		if n := countOverrides(stats); n != 1 {
+			t.Errorf("override count = %d, want 1 (only q_proj)", n)
+		}
+	})
+
+	t.Run("rule none on a protected name overrides nothing", func(t *testing.T) {
+		cfg := &Config{Rules: []ConfigRule{{Match: nameNorm, DType: "none"}}}
+		out := filepath.Join(t.TempDir(), "out.safetensors")
+		stats, err := ConvertFile(ConvertOptions{
+			InputPath:  singleFixturePath,
+			OutputPath: out,
+			Config:     cfg,
+			Default:    TargetFP8E4M3,
+			Protect:    true,
+		})
+		if err != nil {
+			t.Fatalf("ConvertFile: %v", err)
+		}
+		for _, s := range stats {
+			if s.ProtectOverride {
+				t.Errorf("stat (%s).ProtectOverride = true, want false (nothing was converted against the policy)", s.Name)
+			}
+			if s.Name == nameNorm && (s.ToDType != DTypeF16 || s.SkippedWhy == "") {
+				t.Errorf("stat (%s) = (%s, %q), want F16 passthrough", s.Name, s.ToDType, s.SkippedWhy)
+			}
+		}
+		if n := countOverrides(stats); n != 0 {
+			t.Errorf("override count = %d, want 0", n)
+		}
+	})
+}
+
 func TestPlanModelInt8ScaleFollowsOwner(t *testing.T) {
 	cfg := &Config{
 		Rules: []ConfigRule{{Match: nameNorm, DType: "int8"}},
