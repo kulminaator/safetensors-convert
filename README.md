@@ -21,13 +21,15 @@ go build -o stconv ./cmd/stconv
 path - single-file output, the default, always one file - or an existing
 directory, which selects explicit multi-file output.
 
-Convert everything to fp8 (e4m3, the common default for LLM weights):
+Convert to fp8 (e4m3, the common default for LLM weights - precision-
+sensitive tensors stay at their original dtype, see
+[Default precision policy](#default-precision-policy)):
 
 ```
 ./stconv -in model.safetensors -out model.fp8.safetensors -target fp8_e4m3
 ```
 
-Convert everything to int8:
+Convert to int8:
 
 ```
 ./stconv -in model.safetensors -out model.int8.safetensors -target int8
@@ -64,6 +66,34 @@ raise it for a bit more throughput on fast disks):
 ```
 ./stconv -in model.safetensors -out model.fp8.safetensors -target fp8_e4m3 -chunk-elems 262144
 ```
+
+### Default precision policy
+
+By default, not every tensor is converted. The tool keeps precision-
+sensitive tensors at their original dtype, per `quantization-advice.md`
+at the repo root (the reasoning for each category is there):
+
+- **All norm weights** - LayerNorm/RMSNorm, including attention-internal
+  `q_norm`/`k_norm` and numbered vision norms.
+- **Token embeddings** (`embed_tokens` and family equivalents) and the
+  **LM head / output projection**.
+- **Attention projections** (`q/k/v/o_proj` and the fused `qkv`,
+  `in_proj_qkv`, `out_proj` forms) **when the target is fp8** - this
+  tool's fp8 applies no scaling, and these projections must not be fp8
+  without per-channel scaling. Scaled targets (int8, int8_convrot, mxfp4,
+  nvfp4, int4) convert them as normal.
+
+Protected tensors are reported as unchanged with the policy reason
+(e.g. `default policy: norm weights stay at original precision`). Two
+escape hatches:
+
+- `-no-protect` disables the policy and converts every tensor to the
+  target dtype (the pre-policy behavior).
+- An explicit `-config` rule wins over the policy for the tensors it
+  matches - e.g. forcing `int8` on a norm weight converts it. When a run
+  does this, the tool prints one stderr line after the report:
+  `warning: N protected tensor(s) converted by explicit config rules
+  (see quantization-advice.md)`.
 
 ### Multi-file models
 
@@ -125,10 +155,8 @@ For "keep this layer at fp16, quantize that one," pass `-config`:
 {
   "default": "fp8_e4m3",
   "rules": [
-    { "pattern": "^lm_head\\.", "dtype": "none" },
-    { "pattern": "^model\\.embed_tokens\\.", "dtype": "none" },
-    { "pattern": "\\.norm\\.weight$", "dtype": "none" },
-    { "match": "model.layers.0.mlp.down_proj.weight", "dtype": "int8" }
+    { "match": "model.layers.0.mlp.down_proj.weight", "dtype": "int8" },
+    { "pattern": "\\.q_norm\\.weight$", "dtype": "int8" }
   ]
 }
 ```
@@ -140,6 +168,11 @@ For "keep this layer at fp16, quantize that one," pass `-config`:
 - `"dtype"` is one of `fp8_e4m3`, `fp8_e5m2`, `int8`, `int8_convrot`,
   `mxfp4`, `nvfp4`, `int4`, or `none` (leave the tensor exactly as it is in
   the output).
+- Rules take precedence over the [default precision policy](#default-precision-policy):
+  no `none` rules are needed to keep norms, embeddings, or the output head
+  at their original dtype - that is now the default. A rule that converts
+  a protected tensor wins, and the run prints a one-line stderr warning
+  for it (see above). The second rule in the example is such an override.
 
 This is intentionally simple to keep the door open for richer per-layer
 strategies later (block-wise scales, different int8 calibration,
@@ -278,6 +311,10 @@ runs, and watch peak RSS stay flat (see Memory behavior above).
   magnitude 57344, round-trip tolerances).
 - `internal/stconv/config.go` - JSON config file parsing for per-layer
   overrides.
+- `internal/stconv/protect.go` - the built-in default precision policy:
+  name patterns for the tensors kept at their original dtype by default
+  (norms, token embeddings, output head, and attention projections for
+  fp8 targets), per `quantization-advice.md`.
 - `internal/stconv/index.go` - Hugging Face `*.safetensors.index.json`
   parsing (`weight_map`, metadata), shard discovery from a model directory
   (index-driven, with sorted-glob fallback), and the `-in`/`-out` path

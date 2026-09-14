@@ -50,7 +50,7 @@ func run() error {
 	inPath := flag.String("in", "", "input .safetensors file or model directory (required)")
 	outPath := flag.String("out", "", "output .safetensors file, or an existing directory for multi-file output (required)")
 	configPath := flag.String("config", "", "optional JSON config for per-layer dtype overrides")
-	targetStr := flag.String("target", "fp8_e4m3", "default conversion target for tensors not covered by -config: fp8_e4m3, fp8_e5m2, int8, int8_convrot, mxfp4, nvfp4, int4, or none")
+	targetStr := flag.String("target", "fp8_e4m3", "default conversion target for tensors not covered by -config or the default precision policy (disable it with -no-protect): fp8_e4m3, fp8_e5m2, int8, int8_convrot, mxfp4, nvfp4, int4, or none")
 	minElems := flag.Int("min-elems", 0, "skip conversion for tensors with fewer elements than this (e.g. to leave small bias/norm vectors alone)")
 	chunkElems := flag.Int("chunk-elems", stconv.DefaultChunkElems, "elements processed per streaming chunk; bounds peak memory regardless of tensor/file size")
 	noProtect := flag.Bool("no-protect", false, "disable the built-in default precision policy and convert every tensor to the target dtype; by default, protected tensors (norm weights, token embeddings, the output head, and attention projections for fp8 targets) are kept at their original precision - see quantization-advice.md")
