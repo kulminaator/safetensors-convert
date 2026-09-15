@@ -32,17 +32,37 @@ var hardProtectedNames = []string{
 	"model.lm_head.weight",
 	"gpt2.lm_head",
 	"output_layer.weight",
+	// Bias tensors: hard-protected for every target (small 1-D additive
+	// vectors; quantizing them saves nothing and a per-tensor scale on
+	// them degrades the whole vector).
+	"model.language_model.layers.0.input_layernorm.bias",
+	"model.language_model.layers.0.self_attn.q_proj.bias",
+	"model.visual.blocks.0.attn.proj.bias",
+	"model.visual.blocks.0.attn.qkv.bias",
+	"model.visual.blocks.0.mlp.linear_fc1.bias",
+	"model.visual.blocks.0.mlp.linear_fc2.bias",
+	"model.visual.blocks.0.norm1.bias",
+	"model.visual.blocks.0.norm2.bias",
+	"model.visual.merger.norm.bias",
+	"model.visual.patch_embed.proj.bias",
+	// Underscore-named bias parameters (linear-attention dt_bias).
+	"model.language_model.layers.0.linear_attn.dt_bias",
+	"bias",
+	// Small linear-attention (delta-net) control parameters.
+	"model.language_model.layers.0.linear_attn.A_log",
+	"model.language_model.layers.0.linear_attn.in_proj_a.weight",
+	"model.language_model.layers.0.linear_attn.in_proj_b.weight",
+	"model.language_model.layers.0.linear_attn.conv1d.weight",
 }
 
 // Attention projections: protected only for the unscaled fp8 targets.
+// Exactly the q/k/v/o_proj set from quantization-advice.md section 6 -
+// the fused QKV and out_proj forms are NOT in it (see unprotectedNames).
 var fp8OnlyProtectedNames = []string{
 	"model.language_model.layers.0.self_attn.q_proj.weight",
 	"model.language_model.layers.0.self_attn.k_proj.weight",
 	"model.language_model.layers.0.self_attn.v_proj.weight",
 	"model.language_model.layers.0.self_attn.o_proj.weight",
-	"model.language_model.layers.1.linear_attn.in_proj_qkv.weight",
-	"model.language_model.layers.1.linear_attn.out_proj.weight",
-	"model.visual.blocks.0.attn.qkv.weight",
 }
 
 // Names the policy must never touch, for any target.
@@ -52,11 +72,12 @@ var unprotectedNames = []string{
 	"model.language_model.layers.0.mlp.up_proj.weight",
 	"model.visual.patch_embed.proj.weight",
 	"model.visual.pos_embed.weight",
-	"model.language_model.layers.0.linear_attn.conv1d.weight",
-	"model.language_model.layers.0.linear_attn.A_log",
-	"model.language_model.layers.0.linear_attn.dt_bias",
-	"model.visual.blocks.0.attn.qkv.bias",
-	"model.language_model.layers.0.self_attn.q_proj.bias",
+	// Fused QKV and the linear-attention output projection are not in
+	// the attention-projection protection set: they convert for every
+	// target, including the unscaled fp8 ones.
+	"model.visual.blocks.0.attn.qkv.weight",
+	"model.language_model.layers.1.linear_attn.in_proj_qkv.weight",
+	"model.language_model.layers.1.linear_attn.out_proj.weight",
 }
 
 func TestProtectDefaultHardProtected(t *testing.T) {
@@ -106,6 +127,8 @@ func TestProtectDefaultReasons(t *testing.T) {
 		reason string
 	}{
 		{"model.language_model.norm.weight", TargetFP8E4M3, protectReasonNorms},
+		{"model.visual.blocks.0.norm1.bias", TargetFP8E4M3, protectReasonBias},
+		{"model.language_model.layers.0.linear_attn.A_log", TargetFP8E4M3, protectReasonLinAttn},
 		{"model.language_model.embed_tokens.weight", TargetInt8, protectReasonEmbeddings},
 		{"lm_head.weight", TargetMxFP4, protectReasonLMHead},
 		{"model.language_model.layers.0.self_attn.q_proj.weight", TargetFP8E4M3, protectReasonAttnProj},

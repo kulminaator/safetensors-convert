@@ -8,15 +8,19 @@
 //
 //   - hard protection: always kept at the original dtype, for any target.
 //     Norm weights (LayerNorm/RMSNorm, including attention-internal
-//     q_norm/k_norm and numbered vision norms), token embedding tables,
+//     q_norm/k_norm and numbered vision norms), all bias tensors, the
+//     small linear-attention control parameters, token embedding tables,
 //     and the final LM head / output projection.
 //   - fp8-only protection: kept at the original dtype only when the
-//     resolved target is fp8 (e4m3 or e5m2). Attention projections
-//     (q/k/v/o_proj and fused qkv variants) feed the softmax attention
-//     path and have outlier channels; per quantization-advice.md they
-//     must never be fp8 without per-channel scaling, and this tool's fp8
+//     resolved target is fp8 (e4m3 or e5m2). The attention Q/K/V and
+//     output projections (q/k/v/o_proj) feed the softmax attention path
+//     and have outlier channels; per quantization-advice.md they must
+//     never be fp8 without per-channel scaling, and this tool's fp8
 //     applies no scaling at all. Scaled targets (int8, int8_convrot,
-//     mxfp4, nvfp4, int4) are allowed.
+//     mxfp4, nvfp4, int4) are allowed. Fused QKV tensors (qkv,
+//     in_proj_qkv) and the linear-attention output projection (out_proj)
+//     are deliberately not in this set: they convert like any other
+//     weight, for every target.
 //
 // The policy is a default, not a lock: an explicit config rule for a
 // specific tensor name still wins (enforced by the caller), and the whole
@@ -29,6 +33,8 @@ import "regexp"
 // no trailing punctuation), so keep them short and stable.
 const (
 	protectReasonNorms      = "default policy: norm weights stay at original precision"
+	protectReasonBias       = "default policy: bias tensors stay at original precision"
+	protectReasonLinAttn    = "default policy: small linear-attention params stay at original precision"
 	protectReasonEmbeddings = "default policy: token embeddings stay at original precision"
 	protectReasonLMHead     = "default policy: output head stays at original precision"
 	protectReasonAttnProj   = "default policy: attention projections need per-channel scaling, fp8 not applied by default"
@@ -43,12 +49,26 @@ type protectRule struct {
 // "norm" (input_layernorm, post_attention_layernorm, q_norm, k_norm, the
 // final model norm, numbered vision norm1/norm2, plain "norm") and
 // segments with "norm" in the middle (MTP pre_fc_norm_embedding /
-// pre_fc_norm_hidden). Positional embeddings (pos_embed) are
+// pre_fc_norm_hidden). The bias patterns match any tensor whose final
+// segment is exactly "bias" (norm, attention, MLP, patch-embed, merger
+// biases) or ends in "_bias" (underscore-named bias parameters such as
+// the linear-attention dt_bias). The four linear-attention patterns cover
+// the small recurrent control parameters of delta-net-style linear_attn
+// blocks: the per-head decay log (A_log), the gate projections
+// (in_proj_a/in_proj_b), and the short causal conv kernel (conv1d); the
+// dense projections of the same block (in_proj_qkv, in_proj_z, out_proj)
+// are not in this set. Positional embeddings (pos_embed) are
 // deliberately not protected: they are small buffer tables, not the token
 // embedding path the advice covers, and -min-elems already handles them.
 var hardProtectRules = []protectRule{
 	{regexp.MustCompile(`(^|\.)[a-z0-9_]*norm([0-9]+)?\.weight$`), protectReasonNorms},
 	{regexp.MustCompile(`(^|\.)[a-z0-9_]*_norm_[a-z0-9_]*\.weight$`), protectReasonNorms},
+	{regexp.MustCompile(`(^|\.)bias$`), protectReasonBias},
+	{regexp.MustCompile(`(^|\.)[a-z0-9_]+_bias$`), protectReasonBias},
+	{regexp.MustCompile(`(^|\.)A_log$`), protectReasonLinAttn},
+	{regexp.MustCompile(`(^|\.)in_proj_a\.weight$`), protectReasonLinAttn},
+	{regexp.MustCompile(`(^|\.)in_proj_b\.weight$`), protectReasonLinAttn},
+	{regexp.MustCompile(`(^|\.)conv1d\.weight$`), protectReasonLinAttn},
 	{regexp.MustCompile(`embed_tokens\.weight$`), protectReasonEmbeddings},
 	{regexp.MustCompile(`word_embeddings\.weight$`), protectReasonEmbeddings},
 	{regexp.MustCompile(`tok_embeddings\.weight$`), protectReasonEmbeddings},
@@ -58,15 +78,16 @@ var hardProtectRules = []protectRule{
 	{regexp.MustCompile(`output_layer\.weight$`), protectReasonLMHead},
 }
 
-// fp8-only protected names: attention projections and their fused forms.
+// fp8-only protected names: the attention Q/K/V and output projections
+// (q/k/v/o_proj) - exactly the set quantization-advice.md section 6
+// lists. Fused QKV tensors (qkv, in_proj_qkv) and the linear-attention
+// output projection (out_proj) are intentionally absent: they convert
+// like any other weight, for every target.
 var fp8ProtectRules = []protectRule{
 	{regexp.MustCompile(`(^|\.)q_proj\.weight$`), protectReasonAttnProj},
 	{regexp.MustCompile(`(^|\.)k_proj\.weight$`), protectReasonAttnProj},
 	{regexp.MustCompile(`(^|\.)v_proj\.weight$`), protectReasonAttnProj},
 	{regexp.MustCompile(`(^|\.)o_proj\.weight$`), protectReasonAttnProj},
-	{regexp.MustCompile(`(^|\.)qkv\.weight$`), protectReasonAttnProj},
-	{regexp.MustCompile(`in_proj_qkv\.weight$`), protectReasonAttnProj},
-	{regexp.MustCompile(`(^|\.)out_proj\.weight$`), protectReasonAttnProj},
 }
 
 // allTargets lists every convertible target; tests use it to assert that

@@ -121,6 +121,57 @@ Why they are sensitive:
   effective precision. Per-channel scaling fixes this by letting each
   channel use its own range.
 
+The protected set is exactly these four names: q_proj, k_proj, v_proj,
+and o_proj. Fused QKV tensors (qkv, in_proj_qkv) and the linear-attention
+output projection (out_proj) are deliberately not in it: they are
+quantized like any other weight by default.
+
+### 7. Bias tensors
+
+Bias vectors - the additive 1-D bias parameters of attention, MLP,
+normalization, and projection layers, named `.bias` or with an
+underscore suffix (such as the linear-attention `dt_bias`) - should stay
+in BF16:
+
+- They are tiny: one value per output channel, so the memory savings from
+  quantizing them are negligible.
+- They have no averaging effect. A bias value is added to a single output
+  position, so a quantization error in it is a fixed offset on that
+  position, not a noise term that a dense weight matrix would average out.
+- Under a per-tensor scale (the kind a simple quantizer applies), one
+  outlier value in the bias vector sets the scale for the whole vector and
+  degrades every other entry; per-channel scaling would buy nothing, since
+  there is exactly one value per channel.
+- The LayerNorm/RMSNorm biases are already covered by sections 1-2; this
+  section extends the same reasoning to all other bias parameters
+  (attention, MLP, patch-embed, merger, and friends).
+
+### 8. Small linear-attention parameters (A_log, in_proj_a, in_proj_b, conv1d)
+
+Hybrid LLMs with linear-attention (delta-net) blocks carry a few small
+auxiliary parameters that control the recurrent state update instead of
+mixing dense features. They should stay at their original dtype (BF16,
+or F32 for A_log):
+
+- **A_log** - the per-head decay rate, stored in log space. One value per
+  head; a quantization error in log space becomes a *multiplicative* error
+  in the decay factor, and it compounds over the whole sequence length
+  instead of averaging out.
+- **in_proj_a / in_proj_b** - the projections that produce the per-head
+  alpha/beta gate values of the state update. Their outputs are tiny
+  per-head scalars that decide how much of the incoming information
+  replaces the stored state; errors here directly distort the recurrence.
+- **conv1d** - the short causal depthwise conv kernel (kernel size of a
+  few elements). At most a few tens of thousands of values, applied to
+  every position; under a per-tensor scale a single outlier dominates the
+  whole kernel.
+
+All of them are small (a few hundred to a few tens of thousands of
+elements), so the memory savings from quantizing them are negligible, and
+each sits in a high-leverage control path instead of a dense averaging
+matrix. The dense projections of the same block (in_proj_qkv, in_proj_z,
+out_proj) are large mixing matrices and are deliberately NOT in this set.
+
 ## General principles
 
 - Prefer keeping small, high-leverage parameter groups in BF16. The memory

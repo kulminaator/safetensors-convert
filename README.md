@@ -75,13 +75,24 @@ at the repo root (the reasoning for each category is there):
 
 - **All norm weights** - LayerNorm/RMSNorm, including attention-internal
   `q_norm`/`k_norm` and numbered vision norms.
+- **All bias tensors** (any `.bias`, plus underscore-named bias
+  parameters like linear-attention's `dt_bias`) - small 1-D additive
+  vectors: quantizing them saves negligible memory, and with a
+  per-tensor scale a single outlier sets the scale for the whole vector.
+- **Small linear-attention parameters** (`A_log`, `in_proj_a`,
+  `in_proj_b`, `conv1d` in `linear_attn` blocks) - tiny recurrent control
+  parameters (per-head decay log, gate projections, short conv kernel):
+  quantizing them saves nothing, and errors in them compound through the
+  state recurrence. The dense projections of the same block
+  (`in_proj_qkv`, `in_proj_z`, `out_proj`) are not in this set.
 - **Token embeddings** (`embed_tokens` and family equivalents) and the
   **LM head / output projection**.
-- **Attention projections** (`q/k/v/o_proj` and the fused `qkv`,
-  `in_proj_qkv`, `out_proj` forms) **when the target is fp8** - this
-  tool's fp8 applies no scaling, and these projections must not be fp8
-  without per-channel scaling. Scaled targets (int8, int8_convrot, mxfp4,
-  nvfp4, int4) convert them as normal.
+- **Attention projections** (`q/k/v/o_proj`) **when the target is fp8** -
+  this tool's fp8 applies no scaling, and these projections must not be
+  fp8 without per-channel scaling. Scaled targets (int8, int8_convrot,
+  mxfp4, nvfp4, int4) convert them as normal. Fused QKV tensors (`qkv`,
+  `in_proj_qkv`) and the linear-attention output projection (`out_proj`)
+  are not in this set: they convert as normal for every target.
 
 Protected tensors are reported as unchanged with the policy reason
 (e.g. `default policy: norm weights stay at original precision`). Two
@@ -380,8 +391,9 @@ runs, and watch peak RSS stay flat (see Memory behavior above).
   overrides.
 - `internal/stconv/protect.go` - the built-in default precision policy:
   name patterns for the tensors kept at their original dtype by default
-  (norms, token embeddings, output head, and attention projections for
-  fp8 targets), per `quantization-advice.md`.
+  (norms, biases, small linear-attention params, token embeddings, output
+  head, and attention projections for fp8 targets), per
+  `quantization-advice.md`.
 - `internal/stconv/index.go` - Hugging Face `*.safetensors.index.json`
   parsing (`weight_map`, metadata), shard discovery from a model directory
   (index-driven, with sorted-glob fallback), and the `-in`/`-out` path

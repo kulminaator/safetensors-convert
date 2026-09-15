@@ -72,6 +72,14 @@ func packI32(vals ...int32) []byte {
 	return out
 }
 
+func packF32(vals ...float32) []byte {
+	out := make([]byte, len(vals)*4)
+	for i, v := range vals {
+		binary.LittleEndian.PutUint32(out[i*4:], math.Float32bits(v))
+	}
+	return out
+}
+
 // fixtureTensor is one entry of a synthetic safetensors file: name, dtype,
 // preformatted JSON shape (e.g. "[2,4]"), and the full little-endian payload.
 type fixtureTensor struct {
@@ -322,16 +330,30 @@ func qwenLikeTensor(name, shape string, n int) fixtureTensor {
 	return fixtureTensor{name: name, dtype: "BF16", shape: shape, data: packBF16(vals...)}
 }
 
+// qwenLikeF32Tensor is the F32 variant of qwenLikeTensor (same value
+// pattern); the bundled models store the linear-attention A_log in F32.
+func qwenLikeF32Tensor(name, shape string, n int) fixtureTensor {
+	vals := make([]float32, n)
+	for i := range vals {
+		vals[i] = 0.05 * float32(i%7-3)
+	}
+	return fixtureTensor{name: name, dtype: "F32", shape: shape, data: packF32(vals...)}
+}
+
 // writeQwenLike writes a single-shard file whose tensor names follow the
-// bundled Qwen models' naming (embedding, layernorms, q/k/v/o_proj,
-// q/k_norm, mlp projections, final norm, lm_head) plus one I32 buffer to
-// keep exercising the non-float passthrough. It is the fixture for the
+// bundled Qwen models' naming (embedding, layernorms with biases,
+// q/k/v/o_proj with a q bias, q/k_norm, mlp projections, a linear_attn
+// group - in_proj_qkv/a/b, dt_bias, A_log (F32), conv1d, out_proj -
+// final norm, lm_head) plus one I32 buffer to keep exercising the
+// non-float passthrough. It is the fixture for the
 // default-precision-policy e2e test.
 func writeQwenLike(outPath string) {
 	writeSafetensors(outPath, []fixtureTensor{
 		qwenLikeTensor("model.embed_tokens.weight", "[64,32]", 64*32),
 		qwenLikeTensor("model.layers.0.input_layernorm.weight", "[32]", 32),
+		qwenLikeTensor("model.layers.0.input_layernorm.bias", "[32]", 32),
 		qwenLikeTensor("model.layers.0.self_attn.q_proj.weight", "[32,16]", 32*16),
+		qwenLikeTensor("model.layers.0.self_attn.q_proj.bias", "[32]", 32),
 		qwenLikeTensor("model.layers.0.self_attn.k_proj.weight", "[32,16]", 32*16),
 		qwenLikeTensor("model.layers.0.self_attn.v_proj.weight", "[32,16]", 32*16),
 		qwenLikeTensor("model.layers.0.self_attn.o_proj.weight", "[32,16]", 32*16),
@@ -341,6 +363,13 @@ func writeQwenLike(outPath string) {
 		qwenLikeTensor("model.layers.0.mlp.up_proj.weight", "[32,16]", 32*16),
 		qwenLikeTensor("model.layers.0.mlp.down_proj.weight", "[16,32]", 16*32),
 		qwenLikeTensor("model.layers.0.post_attention_layernorm.weight", "[32]", 32),
+		qwenLikeTensor("model.layers.1.linear_attn.in_proj_qkv.weight", "[48,16]", 48*16),
+		qwenLikeTensor("model.layers.1.linear_attn.in_proj_a.weight", "[16,32]", 16*32),
+		qwenLikeTensor("model.layers.1.linear_attn.in_proj_b.weight", "[16,32]", 16*32),
+		qwenLikeTensor("model.layers.1.linear_attn.dt_bias", "[32]", 32),
+		qwenLikeF32Tensor("model.layers.1.linear_attn.A_log", "[16]", 16),
+		qwenLikeTensor("model.layers.1.linear_attn.conv1d.weight", "[32,1,4]", 32*4),
+		qwenLikeTensor("model.layers.1.linear_attn.out_proj.weight", "[16,32]", 16*32),
 		qwenLikeTensor("model.norm.weight", "[32]", 32),
 		qwenLikeTensor("lm_head.weight", "[16,8]", 16*8),
 		{name: "model.layers.0.mlp.position_ids", dtype: "I32", shape: "[4]", data: packI32(0, 1, 2, 3)},

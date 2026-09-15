@@ -666,8 +666,9 @@ func TestConvertSingleNoProtectRestoresBlanketConversion(t *testing.T) {
 // default precision policy (Steps 1+3+4 together): the qwenlike fixture
 // carries realistic names for every protected category, and a default
 // fp8 run with protection on must keep them all at BF16 with the right
-// reason while converting only the MLP projections. It fails without
-// the policy: unprotected, every BF16 tensor would become F8_E4M3.
+// reason while converting the MLP projections and the fused-QKV /
+// linear-attention out_proj weights. It fails without the policy:
+// unprotected, every BF16 tensor would become F8_E4M3.
 func TestConvertQwenLikeDefaultFP8Policy(t *testing.T) {
 	in := filepath.Join("../../testdata/qwenlike", "qwenlike.safetensors")
 	out := filepath.Join(t.TempDir(), "out.safetensors")
@@ -689,7 +690,9 @@ func TestConvertQwenLikeDefaultFP8Policy(t *testing.T) {
 	}{
 		{"model.embed_tokens.weight", DTypeBF16, protectReasonEmbeddings},
 		{"model.layers.0.input_layernorm.weight", DTypeBF16, protectReasonNorms},
+		{"model.layers.0.input_layernorm.bias", DTypeBF16, protectReasonBias},
 		{"model.layers.0.self_attn.q_proj.weight", DTypeBF16, protectReasonAttnProj},
+		{"model.layers.0.self_attn.q_proj.bias", DTypeBF16, protectReasonBias},
 		{"model.layers.0.self_attn.k_proj.weight", DTypeBF16, protectReasonAttnProj},
 		{"model.layers.0.self_attn.v_proj.weight", DTypeBF16, protectReasonAttnProj},
 		{"model.layers.0.self_attn.o_proj.weight", DTypeBF16, protectReasonAttnProj},
@@ -699,6 +702,18 @@ func TestConvertQwenLikeDefaultFP8Policy(t *testing.T) {
 		{"model.layers.0.mlp.up_proj.weight", DTypeF8E4M3, ""},
 		{"model.layers.0.mlp.down_proj.weight", DTypeF8E4M3, ""},
 		{"model.layers.0.post_attention_layernorm.weight", DTypeBF16, protectReasonNorms},
+		// Fused QKV and the linear-attention output projection are not in
+		// the attention-projection protection set: they convert even for
+		// the unscaled fp8 target.
+		{"model.layers.1.linear_attn.in_proj_qkv.weight", DTypeF8E4M3, ""},
+		// The small linear-attention control parameters stay at their
+		// original dtype for every target.
+		{"model.layers.1.linear_attn.in_proj_a.weight", DTypeBF16, protectReasonLinAttn},
+		{"model.layers.1.linear_attn.in_proj_b.weight", DTypeBF16, protectReasonLinAttn},
+		{"model.layers.1.linear_attn.dt_bias", DTypeBF16, protectReasonBias},
+		{"model.layers.1.linear_attn.A_log", DTypeF32, protectReasonLinAttn},
+		{"model.layers.1.linear_attn.conv1d.weight", DTypeBF16, protectReasonLinAttn},
+		{"model.layers.1.linear_attn.out_proj.weight", DTypeF8E4M3, ""},
 		{"model.norm.weight", DTypeBF16, protectReasonNorms},
 		{"lm_head.weight", DTypeBF16, protectReasonLMHead},
 		{"model.layers.0.mlp.position_ids", DTypeI32, "non-float dtype, copied as-is"},
