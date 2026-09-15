@@ -1096,18 +1096,19 @@ func TestConvertNVFP4E2E(t *testing.T) {
 }
 
 // TestStreamMxFP4Pinned pins streamMxFP4's output bytes on hand-computed
-// synthetic blocks: the E8M0 scale byte(s) and the packed E2M1 data.
+// synthetic blocks: the E8M0 scale byte(s) and the unpacked E2M1 codes
+// (one byte per element).
 func TestStreamMxFP4Pinned(t *testing.T) {
 	// All-ones 32-block: blockMax 1 -> code 125 (s = 0.25); each element
-	// 1.0/0.25 = 4 -> e2m1(4) = 0x06, so every data byte is 0x66.
-	// (The plan's "0x44" predates the P1 S1 fix: e2m1(4) is nibble 0x06.)
+	// 1.0/0.25 = 4 -> e2m1(4) = 0x06, so every data byte is the code
+	// 0x06 (unpacked: one element per byte).
 	ones := make([]float32, 32)
 	for i := range ones {
 		ones[i] = 1.0
 	}
-	wantOnes := append([]byte{125}, make([]byte, 16)...)
+	wantOnes := append([]byte{125}, make([]byte, 32)...)
 	for i := 1; i < len(wantOnes); i++ {
-		wantOnes[i] = 0x66
+		wantOnes[i] = 0x06
 	}
 	if got := runMxFP4(t, ones, 32); !bytes.Equal(got, wantOnes) {
 		t.Errorf("all-ones: got % X, want % X", got, wantOnes)
@@ -1118,17 +1119,17 @@ func TestStreamMxFP4Pinned(t *testing.T) {
 	}
 
 	// {6, 3, 1.5, 0.5, rest 0}: blockMax 6 -> code 127 (s = 1); q =
-	// {6,3,1.5,0.5} -> {0x7,0x5,0x3,0x1,0,...} -> bytes 57 13 00...
+	// {6,3,1.5,0.5} -> codes {0x7,0x5,0x3,0x1,0,...}.
 	b6 := make([]float32, 32)
 	b6[0], b6[1], b6[2], b6[3] = 6, 3, 1.5, 0.5
-	wantB6 := append([]byte{127, 0x57, 0x13}, make([]byte, 14)...)
+	wantB6 := append([]byte{127, 0x7, 0x5, 0x3, 0x1}, make([]byte, 28)...)
 	if got := runMxFP4(t, b6, 32); !bytes.Equal(got, wantB6) {
 		t.Errorf("block6: got % X, want % X", got, wantB6)
 	}
 
-	// All-zero 32-block: blockMax 0 -> code 0 (s = 0); every q = 0.
+	// All-zero 32-block: blockMax 0 -> code 0 (s = 0); every code = 0.
 	zeros := make([]float32, 32)
-	wantZeros := append([]byte{0}, make([]byte, 16)...)
+	wantZeros := append([]byte{0}, make([]byte, 32)...)
 	if got := runMxFP4(t, zeros, 32); !bytes.Equal(got, wantZeros) {
 		t.Errorf("zeros: got % X, want % X", got, wantZeros)
 	}
@@ -1142,23 +1143,22 @@ func TestStreamMxFP4Pinned(t *testing.T) {
 		tiny[i] = 1e-40
 	}
 	tiny[0] = float32(math.Ldexp(1, -126)) // 2^-126, smallest normal f32
-	wantTiny := append([]byte{1, 0x02}, make([]byte, 15)...)
+	wantTiny := append([]byte{1, 0x02}, make([]byte, 31)...)
 	if got := runMxFP4(t, tiny, 32); !bytes.Equal(got, wantTiny) {
 		t.Errorf("tiny: got % X, want % X", got, wantTiny)
 	}
 
 	// 33 elements: 2 blocks (32 + 1). Scales: two code-125 bytes. Data:
-	// 16 bytes of 0x66 (full block) + 1 byte 0x06 (the single element
-	// 1.0, trailing pad nibble 0) = 17 bytes; the final nibble is 0.
+	// 33 bytes of 0x06 (one per element - no pad byte, unlike the
+	// packed 2-per-byte targets).
 	thirtythree := make([]float32, 33)
 	for i := range thirtythree {
 		thirtythree[i] = 1.0
 	}
-	want33 := append([]byte{125, 125}, make([]byte, 17)...)
-	for i := 2; i < 18; i++ {
-		want33[i] = 0x66
+	want33 := append([]byte{125, 125}, make([]byte, 33)...)
+	for i := 2; i < len(want33); i++ {
+		want33[i] = 0x06
 	}
-	want33[18] = 0x06
 	if got := runMxFP4(t, thirtythree, 32); !bytes.Equal(got, want33) {
 		t.Errorf("33 elems: got % X, want % X", got, want33)
 	}
@@ -1169,13 +1169,14 @@ func TestStreamMxFP4Pinned(t *testing.T) {
 }
 
 // TestConvertMxFP4E2E runs the full MXFP4 conversion on a seeded random
-// tensor: it pins the P2 S3 header layout (the U8 block-scale sibling
-// before the U8 owner), checks the output sizes, and verifies the RNE
-// property - each stored nibble is exactly the RNE E2M1 of x/s, and the
-// dequantized value |deq - x| stays within the E2M1 quantization bound.
+// tensor: it pins the header layout (the U8 block-scale sibling before
+// the U8 owner, the owner keeping the SOURCE shape with one byte per
+// element), checks the output sizes, and verifies the RNE property -
+// each stored code is exactly the RNE E2M1 of x/s, and the dequantized
+// value |deq - x| stays within the E2M1 quantization bound.
 func TestConvertMxFP4E2E(t *testing.T) {
 	rnd := rand.New(rand.NewSource(99))
-	n := 1001 // 31 full blocks + one 9-element partial block (odd -> pad)
+	n := 1001 // 31 full blocks + one 9-element partial block
 	vals := make([]float32, n)
 	for i := range vals {
 		vals[i] = float32(rnd.Float64()*2 - 1)
@@ -1204,15 +1205,20 @@ func TestConvertMxFP4E2E(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading output header: %v", err)
 	}
-	// P2 S3 layout: the U8 block-scale sibling (ceil(n/32) bytes) precedes
-	// the U8 owner (ceil(n/2) bytes).
+	// Layout: the U8 block-scale sibling (ceil(n/32) bytes) precedes the
+	// U8 owner (n bytes, one unpacked code per element).
 	checkOutHeader(t, outHeader, []outEntry{
 		{"w.block_scale", DTypeU8, [2]int64{0, 32}},
-		{"w", DTypeU8, [2]int64{32, 533}},
+		{"w", DTypeU8, [2]int64{32, 32 + int64(n)}},
 	})
 	for _, e := range outHeader.Tensors {
 		if e.Name == "w.block_scale" && !reflect.DeepEqual(e.Info.Shape, []int64{32}) {
 			t.Errorf("block_scale shape = %v, want [32]", e.Info.Shape)
+		}
+		// The owner keeps the source shape (the transformers-loadability
+		// fix): a halved packed shape is what broke from_pretrained.
+		if e.Name == "w" && !reflect.DeepEqual(e.Info.Shape, []int64{int64(n)}) {
+			t.Errorf("owner shape = %v, want [n] = %v", e.Info.Shape, []int64{int64(n)})
 		}
 	}
 
@@ -1221,18 +1227,11 @@ func TestConvertMxFP4E2E(t *testing.T) {
 		t.Fatalf("block_scale has %d bytes, want 32", len(scales))
 	}
 	data := readTensorBytes(t, outPath, "w")
-	if len(data) != 501 {
-		t.Fatalf("owner has %d bytes, want 501", len(data))
-	}
-	nibbles := unpackNibbles(data)
-	if len(nibbles) != n+1 { // 1001 is odd -> one pad nibble
-		t.Fatalf("decoded %d nibbles, want %d (incl. pad)", len(nibbles), n+1)
-	}
-	if nibbles[n] != 0 {
-		t.Errorf("trailing pad nibble = 0x%02x, want 0x00", nibbles[n])
+	if len(data) != n { // one byte per element, no pad
+		t.Fatalf("owner has %d bytes, want %d", len(data), n)
 	}
 
-	// RNE property, per element: the stored nibble equals the RNE E2M1 of
+	// RNE property, per element: the stored code equals the RNE E2M1 of
 	// x/s exactly, and |deq - x| is within the E2M1 quantization bound.
 	// The bound is s (the plan's 0.5*s is too tight for the non-uniform
 	// E2M1 grid: the max-magnitude element sits in (3,6] where the largest
@@ -1244,14 +1243,14 @@ func TestConvertMxFP4E2E(t *testing.T) {
 		if s != 0 {
 			want = f32ToE2M1(x / s)
 		}
-		if nibbles[i] != want {
+		if data[i] != want {
 			if bad < 20 {
-				t.Errorf("elem %d (x=%v, s=%v): nibble 0x%02x, want 0x%02x", i, x, s, nibbles[i], want)
+				t.Errorf("elem %d (x=%v, s=%v): code 0x%02x, want 0x%02x", i, x, s, data[i], want)
 			}
 			bad++
 			continue
 		}
-		deq := e2m1ToF32(nibbles[i]) * s
+		deq := e2m1ToF32(data[i]) * s
 		if d := math.Abs(float64(deq) - float64(x)); d > float64(s)+2e-6 {
 			if bad < 40 {
 				t.Errorf("elem %d (x=%v, deq=%v): |deq - x| = %v > s = %v", i, x, deq, d, s)
@@ -1284,12 +1283,12 @@ func refBlockMax(vals []float32) float32 {
 
 // refMxFP4Serial is the serial (pre-parallelization) MXFP4 algorithm:
 // all 32-element block scale bytes first (e8m0Encode of the block max,
-// the ".block_scale" sibling), then the packed E2M1 data (two elements
-// per byte, an odd final block zero-padded), each block's scale
-// recomputed on the data pass. TestMxFP4NVFP4ParallelMatchSerial pins
-// the parallel streamMxFP4 against it.
+// the ".block_scale" sibling), then the unpacked E2M1 codes (one byte
+// per element, no pad), each block's scale recomputed on the data pass.
+// TestMxFP4NVFP4ParallelMatchSerial pins the parallel streamMxFP4
+// against it.
 func refMxFP4Serial(vals []float32) []byte {
-	out := make([]byte, 0, (len(vals)+mxfp4Block-1)/mxfp4Block+(len(vals)+1)/2)
+	out := make([]byte, 0, (len(vals)+mxfp4Block-1)/mxfp4Block+len(vals))
 	for i := 0; i < len(vals); i += mxfp4Block {
 		cnt := mxfp4Block
 		if len(vals)-i < cnt {
@@ -1304,13 +1303,13 @@ func refMxFP4Serial(vals []float32) []byte {
 		}
 		blk := vals[i : i+cnt]
 		s := e8m0Scale(e8m0Encode(refBlockMax(blk)))
-		qv := make([]uint8, cnt)
-		for j, v := range blk {
+		for _, v := range blk {
+			var c uint8
 			if s != 0 {
-				qv[j] = f32ToE2M1(v / s)
+				c = f32ToE2M1(v / s)
 			}
+			out = append(out, c)
 		}
-		out = append(out, packNibbles(qv)...)
 	}
 	return out
 }
@@ -1381,7 +1380,8 @@ func refNVFP4Serial(vals []float32) []byte {
 // passes against the serial algorithm: seeded random tensors - 1,000,000
 // elements (a multiple of both block sizes: full blocks only) and
 // 1,000,033 (not a multiple of 32 or 16: the final block is a single
-// element, odd, so the packed output carries a pad nibble) - run through
+// element, odd, so nvfp4's packed output carries a pad nibble; mxfp4's
+// unpacked output carries no pad) - run through
 // both targets with chunkElems = 1000 (mxfp4 rounds it up to 1024 = 32
 // blocks, nvfp4 to 1008 = 63 blocks: each chunk fans out over 16 workers
 // and the final chunk is partial). The parallel output bytes must equal

@@ -153,7 +153,10 @@ const mxfp4Block = 32
 // into blocks of 32, each block gets an E8M0 scale (e8m0Encode of the
 // block max, ignoring NaN/Inf - the same convention as the int8 max-abs
 // scan) and each element is quantized to E2M1 (round-to-nearest-even) at
-// that scale, two elements packed per byte.
+// that scale, one code per U8 byte (unpacked - see the TargetMxFP4 case
+// in planTensor for why mxfp4 unlike int4/nvfp4 keeps the source shape
+// in the header, so standard loaders can match it against the model
+// parameter's shape).
 //
 // The conversion takes two chunked passes over the source, matching the
 // header layout (the ".block_scale" sibling precedes the owner):
@@ -163,23 +166,22 @@ const mxfp4Block = 32
 //	buffer; the chunk's scales are written in one call.
 //	pass 2 (data): per block, RECOMPUTE the block max and code (recompute,
 //	never buffer), s := e8m0Scale(code) (code 0 -> s 0), q_i :=
-//	f32ToE2M1(x_i / s) (s == 0 -> 0), pack into the chunk's packed
-//	buffer; the chunk's packed bytes are written in one call.
+//	f32ToE2M1(x_i / s) (s == 0 -> 0), store the codes in the chunk's
+//	codes buffer (one byte per element); the chunk's codes are written in
+//	one call.
 //
 // The effective read chunk is a whole number of 32-element blocks: the
 // caller's chunkElems is rounded up to the next multiple of 32 (a value
 // below one block becomes a single block), so an interior read never
-// splits a block - only the tensor's final block may be partial, and its
-// packNibbles zero-pads the trailing nibble. Within each chunk the
-// per-block work is fanned out across cores (mapStrided over the chunk's
-// blocks): pass 1 stores one E8M0 byte per block in the chunk-sized
-// scales buffer and pass 2 stores each block's packed bytes in a
-// disjoint sub-range of the chunk-sized packed buffer, so each pass
+// splits a block - only the tensor's final block may be partial. Within
+// each chunk the per-block work is fanned out across cores (mapStrided
+// over the chunk's blocks): pass 1 stores one E8M0 byte per block in
+// the chunk-sized scales buffer and pass 2 stores each block's codes in
+// a disjoint sub-range of the chunk-sized codes buffer, so each pass
 // issues one write per chunk instead of one per block. The only
-// non-chunk state is the chunk-sized f32 decode buffer, the chunk-sized
-// scales and packed buffers, and the per-worker quantized-value scratch
-// (one slice per fan-out worker, at most 32 uint8 each) - all bounded by
-// the chunk or by the CPU count times the block size, never the tensor.
+// non-chunk state is the chunk-sized f32 decode buffer and the
+// chunk-sized scales and codes buffers - all bounded by the chunk,
+// never the tensor.
 func streamMxFP4(r io.ReaderAt, w io.Writer, offset int64, srcDType DType, numElems int64, chunkElems int, sc *passScratch, prog *Progress) error {
 	elemSize, err := srcDType.ByteSize()
 	if err != nil {
@@ -199,23 +201,14 @@ func streamMxFP4(r io.ReaderAt, w io.Writer, offset int64, srcDType DType, numEl
 	// Memory bound (memory rule): rawBuf/rawBuf2 (the chunk's raw bytes,
 	// the second is the prefetch's double buffer) and fbuf (the chunk's
 	// f32 decode) scale with the chunk; scales holds one E8M0 byte per
-	// block in a full chunk (chunk/32 bytes) and packed holds the chunk's
-	// packed output ((chunk+1)/2 bytes). All are bounded by the chunk,
-	// never the tensor. qs is the per-worker quantized-value scratch for
-	// pass 2: parallelism-many slices, each at most mxfp4Block uint8,
-	// bounded by the CPU count times the block size, never the tensor.
+	// block in a full chunk (chunk/32 bytes) and codes holds the
+	// chunk's unpacked output (one byte per element). All are bounded by
+	// the chunk, never the tensor.
 	rawBuf := sc.raw1[:chunk*int64(elemSize)]
 	rawBuf2 := sc.raw2[:chunk*int64(elemSize)]
 	fbuf := sc.fbuf[:int(chunk)]
 	scales := sc.mxfp4Scales[:chunk/mxfp4Block]
-	packed := sc.mxfp4Packed[:(chunk+1)/2]
-	// qs gives each fan-out worker its own quantized-value scratch (at
-	// most mxfp4Block uint8) so concurrent blocks never share a buffer.
-	// Sized parallelism(full-chunk block count): bounded by the CPU count
-	// (never the chunk or tensor), and parallelism is monotone, so the
-	// scratch's slice (sized for the max window) covers every smaller
-	// final chunk.
-	qs := sc.mxfp4Qs[:max(1, parallelism(int(chunk/mxfp4Block)))]
+	codes := sc.mxfp4Codes[:chunk]
 
 	// blockMax is the max |v| over vals, ignoring NaN/Inf (same convention
 	// as the int8 max-abs scan: those are clamped at quantize time).
@@ -336,19 +329,16 @@ func streamMxFP4(r io.ReaderAt, w io.Writer, offset int64, srcDType DType, numEl
 	}
 
 	// Pass 2 (data): recompute each block's max and code, quantize the
-	// elements to E2M1 at the decoded scale, and pack two per byte. The
-	// per-block quantize+pack is fanned out across the chunk's blocks
-	// (mapStrided): each worker writes its block's packed bytes into a
-	// disjoint sub-range of the chunk-sized packed buffer, using its own
-	// qs scratch (qs[b%k] for k workers - each worker owns one residue
-	// class mod k, so no buffer is shared). The write is one per chunk.
-	// A full 32-element block packs to exactly 16 bytes, so block b's
-	// sub-range starts at byte b*16; the partial final block packs to
-	// (cnt+1)/2 bytes and its trailing pad nibble is zeroed by
-	// packNibblesInto's prefix zeroing.
+	// elements to E2M1 at the decoded scale, and store one code per
+	// byte. The per-block quantize is fanned out across the chunk's
+	// blocks (mapStrided): each worker writes its block's codes into a
+	// disjoint sub-range of the chunk-sized codes buffer (the codes are
+	// written in place, so no per-worker scratch is needed). The write
+	// is one per chunk; the chunk's output is len(fl) bytes, one per
+	// element - no pad byte exists, unlike the 2-per-byte packed
+	// targets.
 	if err := forEachBlock(func(fl []float32) error {
 		numBlocks := (len(fl) + mxfp4Block - 1) / mxfp4Block
-		k := parallelism(numBlocks)
 		mapStrided(numBlocks, func(b int) {
 			lo := b * mxfp4Block
 			cnt := mxfp4Block
@@ -357,21 +347,15 @@ func streamMxFP4(r io.ReaderAt, w io.Writer, offset int64, srcDType DType, numEl
 			}
 			vals := fl[lo : lo+cnt]
 			s := e8m0Scale(e8m0Encode(blockMax(vals)))
-			qv := qs[b%k][:cnt]
 			for i, v := range vals {
 				if s == 0 {
-					qv[i] = 0
+					codes[lo+i] = 0
 				} else {
-					qv[i] = f32ToE2M1(v / s)
+					codes[lo+i] = f32ToE2M1(v / s)
 				}
 			}
-			// packNibblesInto zero-prefixes its dst, so the reused
-			// packed sub-range cannot leak stale nibbles.
-			packNibblesInto(packed[b*mxfp4Block/2:], qv)
 		})
-		// The chunk's packed output is (len(fl)+1)/2 bytes: each full
-		// block contributes 16 and the partial final block (cnt+1)/2.
-		_, err := w.Write(packed[:(len(fl)+1)/2])
+		_, err := w.Write(codes[:len(fl)])
 		return err
 	}); err != nil {
 		return err

@@ -243,12 +243,12 @@ whole tensor - let alone a whole file - into memory:
   double-buffered raw input (the current chunk plus the prefetched next
   one - the +1 prefetch buffer, which also overlaps each chunk's disk read
   with the previous chunk's compute), the f32 decode buffer, the
-  encode/pack output buffers, the mxfp4/nvfp4 scale and packed buffers, and
-  the convrot window's group buffers (one 256-element f32 buffer per
-  rotation group in the window). The total is
-  `passScratchSize(chunkElems)` - `O(chunk) x small constant`, ~26.6MB at
-  the default `2^20` chunk - plus a few per-worker scratch slices bounded
-  by the CPU count. Memory stays `O(chunk)`, independent of tensor count,
+  encode/pack output buffers, the mxfp4 scale and codes buffers, the
+  nvfp4 scale and packed buffers, and the convrot window's group buffers
+  (one 256-element f32 buffer per rotation group in the window). The total
+  is `passScratchSize(chunkElems)` - `O(chunk) x small constant`, ~27.1MB
+  at the default `2^20` chunk - plus a few per-worker scratch slices
+  bounded by the CPU count. Memory stays `O(chunk)`, independent of tensor count,
   tensor size, and file size.
 
 Measured on the bundled regression models with the default chunk, peak RSS
@@ -347,32 +347,48 @@ runs, and watch peak RSS stay flat (see Memory behavior above).
 - **mxfp4** (OCP microscaling): E2M1 4-bit elements (values
   0/0.5/1/1.5/2/3/4/6, max magnitude 6) in 32-element blocks; per-block
   E8M0 scale = smallest power of two >= `blockMax/6` (so the scaled block
-  max lands in (3,6]); round-to-nearest-even element rounding.
+  max lands in (3,6]); round-to-nearest-even element rounding. Stored
+  unpacked (one code byte per element, source shape kept) - see the
+  storage convention below.
 - **nvfp4** (NVIDIA FP4): E2M1 elements in 16-element blocks; per-block
   E4M3 scale (round-to-nearest-even, saturating at 448) plus a per-tensor
   F32 global scale `α = max|x| / (6·448)`; dequant is `q·s·α`.
 - **int4**: naive per-tensor symmetric int4, `scale = max|x| / 7`,
   round-to-nearest-even, clamped to `[-7, 7]`; a `.scale` sibling like
   int8's.
-- **Storage convention for the 4-bit targets.** The safetensors spec has no
-  4-bit dtype, so packed 4-bit data (2 elements per byte, element `2i` in
-  the low nibble) and E8M0 block scales are stored as `U8`; NVFP4 block
-  scales as `F8_E4M3`; all scalar/row scales as `F32`. Sibling names:
-  `.scale` (int8, int4, int8_convrot), `.block_scale` (mxfp4, nvfp4),
-  `.global_scale` (nvfp4). Scalar-scale siblings follow their owner in the
-  file; vector-scale siblings (convrot row scales, mxfp4/nvfp4 block
-  scales) precede it - in the file and in the output index's `weight_map`
-  order. Packed 4-bit owner tensors (int4, mxfp4, nvfp4) carry the
-  **packed** shape in the header, not the pre-packing element shape: the
-  last dimension is halved when it is even (the usual case), else the
-  nearest even dimension scanning backwards is halved (e.g. `[32,1] ->
-  [16,1]`), else the shape is 1-D `[ceil(elems/2)]` (e.g. `[3,3] -> [5]`);
-  zero-element tensors keep their shape. This keeps the spec's byte-count
-  invariant `prod(shape) == packed byte count`, so standard loaders
-  (`safetensors`, transformers, vLLM) can open the files. Unpacking the
-  nibbles (low nibble = element `2i`) is a loader-side convention, and the
-  packed byte stream is flat row-major - the packed-shape fix is
-  header-only: the data bytes are unchanged.
+- **Storage convention for the 4-bit targets.** The safetensors spec has
+  no 4-bit dtype, so 4-bit data and E8M0 block scales are stored as `U8`;
+  NVFP4 block scales as `F8_E4M3`; all scalar/row scales as `F32`. Sibling
+  names: `.scale` (int8, int4, int8_convrot), `.block_scale` (mxfp4,
+  nvfp4), `.global_scale` (nvfp4). Scalar-scale siblings follow their
+  owner in the file; vector-scale siblings (convrot row scales, mxfp4/nvfp4
+  block scales) precede it - in the file and in the output index's
+  `weight_map` order. The 4-bit data layouts differ on purpose:
+  - **mxfp4 owners are UNPACKED**: one `U8` byte per element holding the
+    raw E2M1 code (0..15), and the header keeps the **source** shape.
+    Model-loading loaders (transformers' `from_pretrained`) match each
+    checkpoint tensor against the model parameter's shape, so a halved
+    packed shape aborts the load as a size mismatch; unpacking keeps the
+    shape matchable while the file stays 4-bit information-dense (1 byte
+    per weight + 1 scale byte per 32 weights). A dequantizing consumer
+    applies `value[i] = e2m1_LUT[code[i]] * 2^(block_scale[i/32] - 127)` -
+    E2M1 LUT `[0, 0.5, 1, 1.5, 2, 3, 4, 6, -0, -0.5, -1, -1.5, -2, -3,
+    -4, -6]`, flat row-major 32-element blocks, E8M0 bias 127.
+  - **int4/nvfp4 owners stay PACKED** (2 elements per byte, element `2i`
+    in the low nibble) and carry the **packed** shape in the header, not
+    the pre-packing element shape: the last dimension is halved when it is
+    even (the usual case), else the nearest even dimension scanning
+    backwards is halved (e.g. `[32,1] -> [16,1]`), else the shape is 1-D
+    `[ceil(elems/2)]` (e.g. `[3,3] -> [5]`); zero-element tensors keep
+    their shape. This keeps the spec's byte-count invariant
+    `prod(shape) == packed byte count`, so standard loaders can open the
+    files. Unpacking the nibbles (low nibble = element `2i`) is a
+    loader-side convention, and the packed byte stream is flat row-major -
+    the packed-shape fix is header-only: the data bytes are unchanged.
+    Note the trade-off: the halved shape does not match the model
+    parameter's shape, so model-loading loaders report a size mismatch for
+    these owners; the same unpacking applies if/when they need
+    `from_pretrained` compatibility.
 - Non-float tensors (int/bool weights, buffers, etc.) are always copied
   through unchanged - quantizing already-integer tensors is out of scope.
 - Tensor order and any `__metadata__` block from the input header are
@@ -468,9 +484,14 @@ runs, and watch peak RSS stay flat (see Memory behavior above).
   row width is a multiple of 256, which covers typical LLM linear layers.
   As a value-changing conversion it also needs a serving side that applies
   the matching activation rotation (see How conversion works).
-- mxfp4, nvfp4, and int4 outputs need a loader with the matching
-  dequantization path - the same "defined-but-not-universal convention"
-  caveat as the int8 `.scale` note.
+- 4-bit outputs need a loader with the matching dequantization path - the
+  same "defined-but-not-universal convention" caveat as the int8 `.scale`
+  note. mxfp4 owners keep the source shape (unpacked codes), so model
+  loaders like transformers' `from_pretrained` can place them without a
+  size mismatch (the loaded values are the raw codes, not dequantized
+  weights - plain transformers has no mxfp4 dequantization path for dense
+  models); int4/nvfp4 owners still carry the packed (halved) shape, which
+  such loaders report as a size mismatch.
 - The `.scale` sibling-tensor convention for int8 is this tool's own
   choice, not a safetensors standard - if you need compatibility with a
   specific downstream loader (e.g. a particular inference engine's

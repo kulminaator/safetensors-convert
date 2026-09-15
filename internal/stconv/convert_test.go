@@ -383,10 +383,10 @@ func TestConvertSingleAttnProjFP8OnlyProtection(t *testing.T) {
 			"mxfp4", TargetMxFP4,
 			[]outEntry{
 				{nameUpProj + ".block_scale", DTypeU8, [2]int64{0, 1}},
-				{nameUpProj, DTypeU8, [2]int64{1, 5}},
-				{nameQProj + ".block_scale", DTypeU8, [2]int64{5, 6}}, // converted: scaled target
-				{nameQProj, DTypeU8, [2]int64{6, 8}},
-				{nameNorm, DTypeF16, [2]int64{8, 16}},
+				{nameUpProj, DTypeU8, [2]int64{1, 9}},
+				{nameQProj + ".block_scale", DTypeU8, [2]int64{9, 10}}, // converted: scaled target
+				{nameQProj, DTypeU8, [2]int64{10, 14}},
+				{nameNorm, DTypeF16, [2]int64{14, 22}},
 			},
 			"",
 		},
@@ -968,13 +968,13 @@ func TestConvertEmptyTensorsOtherTargets(t *testing.T) {
 const oddFixturePath = "../../testdata/odd/odd.safetensors"
 
 // TestConvertOddPackedTargets is the spec-invariant regression test for
-// the packed 4-bit owner header shapes (int4/mxfp4/nvfp4): it converts
-// the odd fixture to each target and asserts, for every tensor in the
-// output header, the safetensors spec invariant data span ==
-// prod(shape) × itemsize(dtype) - the exact check the official loader
-// enforces. It fails on the pre-fix code, which wrote the full
-// pre-packing element shape into the owner header while storing only
-// (numElems+1)/2 bytes.
+// the 4-bit owner header shapes (int4/nvfp4 packed 2-per-byte, mxfp4
+// unpacked 1-byte-per-code): it converts the odd fixture to each target
+// and asserts, for every tensor in the output header, the safetensors
+// spec invariant data span == prod(shape) × itemsize(dtype) - the exact
+// check the official loader enforces. It fails on the pre-fix code, which
+// wrote the full pre-packing element shape into the packed owner header
+// while storing only (numElems+1)/2 bytes.
 func TestConvertOddPackedTargets(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -1008,21 +1008,21 @@ func TestConvertOddPackedTargets(t *testing.T) {
 			"mxfp4", TargetMxFP4,
 			[]outEntry{
 				{"w.a.block_scale", DTypeU8, [2]int64{0, 1}},
-				{"w.a", DTypeU8, [2]int64{1, 17}},
-				{"w.b.block_scale", DTypeU8, [2]int64{17, 18}},
-				{"w.b", DTypeU8, [2]int64{18, 23}},
-				{"w.c.block_scale", DTypeU8, [2]int64{23, 24}},
-				{"w.c", DTypeU8, [2]int64{24, 27}},
-				{"w.d.block_scale", DTypeU8, [2]int64{27, 35}},
-				{"w.d", DTypeU8, [2]int64{35, 163}},
-				{"w.e.block_scale", DTypeU8, [2]int64{163, 163}},
-				{"w.e", DTypeU8, [2]int64{163, 163}},
+				{"w.a", DTypeU8, [2]int64{1, 33}},
+				{"w.b.block_scale", DTypeU8, [2]int64{33, 34}},
+				{"w.b", DTypeU8, [2]int64{34, 43}},
+				{"w.c.block_scale", DTypeU8, [2]int64{43, 44}},
+				{"w.c", DTypeU8, [2]int64{44, 49}},
+				{"w.d.block_scale", DTypeU8, [2]int64{49, 57}},
+				{"w.d", DTypeU8, [2]int64{57, 313}},
+				{"w.e.block_scale", DTypeU8, [2]int64{313, 313}},
+				{"w.e", DTypeU8, [2]int64{313, 313}},
 			},
 			map[string][]int64{
-				"w.a.block_scale": {}, "w.a": {16, 1}, // ceil(32/32)=1 -> scalar
-				"w.b.block_scale": {}, "w.b": {5}, // ceil(9/32)=1  -> scalar
-				"w.c.block_scale": {}, "w.c": {3}, // ceil(5/32)=1  -> scalar
-				"w.d.block_scale": {8}, "w.d": {2, 64},
+				"w.a.block_scale": {}, "w.a": {32, 1}, // unpacked: source shape kept
+				"w.b.block_scale": {}, "w.b": {3, 3},
+				"w.c.block_scale": {}, "w.c": {5},
+				"w.d.block_scale": {8}, "w.d": {2, 128},
 				"w.e.block_scale": {0}, "w.e": {0, 8},
 			},
 		},
@@ -1625,8 +1625,7 @@ func TestPassScratchBounds(t *testing.T) {
 			w*4 + // fbuf (f32 decode)
 			w + // out (fp8/int8, 1 byte/elem)
 			(w+1)/2 + // packedInt4 (2 elems/byte)
-			w/32 + (w+1)/2 + // mxfp4 scales + packed
-			int64(max(1, parallelism(int(w/32))))*32 + // mxfp4 per-worker quantize scratch
+			w/32 + w + // mxfp4 scales + unpacked codes (1 byte/elem)
 			w/16 + (w+1)/2 + // nvfp4 scales + packed
 			int64(max(1, parallelism(int(w/16))))*16 + // nvfp4 per-worker quantize scratch
 			w*4 + // convrot groups (one f32/elem)
@@ -1644,10 +1643,7 @@ func TestPassScratchBounds(t *testing.T) {
 		actual += int64(cap(sc.fbuf)) * 4
 		actual += int64(cap(sc.out))
 		actual += int64(cap(sc.packedInt4))
-		actual += int64(cap(sc.mxfp4Scales)) + int64(cap(sc.mxfp4Packed))
-		for _, q := range sc.mxfp4Qs {
-			actual += int64(cap(q))
-		}
+		actual += int64(cap(sc.mxfp4Scales)) + int64(cap(sc.mxfp4Codes))
 		actual += int64(cap(sc.nvfp4Scales)) + int64(cap(sc.nvfp4Packed))
 		for _, q := range sc.nvfp4Qs {
 			actual += int64(cap(q))
@@ -1849,9 +1845,9 @@ func TestPlanTensorNewTargetHeaders(t *testing.T) {
 			TargetMxFP4,
 			[]outEntry{
 				{"w.block_scale", DTypeU8, [2]int64{0, 8}}, // 256/32 = 8 E8M0 bytes, before owner
-				{"w", DTypeU8, [2]int64{8, 136}},           // 128 packed bytes
+				{"w", DTypeU8, [2]int64{8, 264}},           // 256 unpacked code bytes
 			},
-			[]int64{2, 64}, // packed: last dim halved
+			[]int64{2, 128}, // unpacked 1 byte/elem: source shape kept
 		},
 		{
 			TargetNVFP4,
@@ -3234,14 +3230,14 @@ func TestConvertModelMultiFileNew4BitTargets(t *testing.T) {
 			target: TargetMxFP4,
 			shard1: []outEntry{
 				{nameUpProj + ".block_scale", DTypeU8, [2]int64{0, 1}},
-				{nameUpProj, DTypeU8, [2]int64{1, 5}},
-				{nameQProj + ".block_scale", DTypeU8, [2]int64{5, 6}},
-				{nameQProj, DTypeU8, [2]int64{6, 8}},
+				{nameUpProj, DTypeU8, [2]int64{1, 9}},
+				{nameQProj + ".block_scale", DTypeU8, [2]int64{9, 10}},
+				{nameQProj, DTypeU8, [2]int64{10, 14}},
 			},
 			shard2: []outEntry{
 				{nameNorm + ".block_scale", DTypeU8, [2]int64{0, 1}},
-				{nameNorm, DTypeU8, [2]int64{1, 3}},
-				{namePosIDs, DTypeI32, [2]int64{3, 19}},
+				{nameNorm, DTypeU8, [2]int64{1, 5}},
+				{namePosIDs, DTypeI32, [2]int64{5, 21}},
 			},
 			weightMap: map[string]string{
 				nameUpProj + ".block_scale": multiShard1,
@@ -3258,7 +3254,7 @@ func TestConvertModelMultiFileNew4BitTargets(t *testing.T) {
 				nameNorm + ".block_scale", nameNorm,
 				namePosIDs,
 			},
-			totalSize: 27, // (1+4)+(1+2) + (1+2)+16
+			totalSize: 35, // (1+8)+(1+4) + (1+4)+16
 		},
 		{
 			name:   "nvfp4",
@@ -3494,7 +3490,8 @@ func TestConvertModelConfigMixedTargets(t *testing.T) {
 
 	// One sibling layout per resolved target, in input tensor order:
 	// convrot's (1-D -> one row -> scalar) F32 scale before the I8 owner;
-	// mxfp4's E8M0 block scales (64/32 = 2) before the packed owner;
+	// mxfp4's E8M0 block scales (64/32 = 2) before the owner (64 unpacked
+	// code bytes, source shape kept);
 	// nvfp4's F32 global scale + E4M3 block scales (48/16 = 3) before the
 	// packed owner; int4's packed owner followed by its scalar F32 scale;
 	// the "none" tensor passthrough at F32; the default fp8_e4m3 tensor.
@@ -3502,14 +3499,14 @@ func TestConvertModelConfigMixedTargets(t *testing.T) {
 		{"w.convrot.scale", DTypeF32, [2]int64{0, 4}},
 		{"w.convrot", DTypeI8, [2]int64{4, 260}},
 		{"w.mx.block_scale", DTypeU8, [2]int64{260, 262}},
-		{"w.mx", DTypeU8, [2]int64{262, 294}},
-		{"w.nv.global_scale", DTypeF32, [2]int64{294, 298}},
-		{"w.nv.block_scale", DTypeF8E4M3, [2]int64{298, 301}},
-		{"w.nv", DTypeU8, [2]int64{301, 325}},
-		{"w.i4", DTypeU8, [2]int64{325, 341}},
-		{"w.i4.scale", DTypeF32, [2]int64{341, 345}},
-		{"w.skip", DTypeF32, [2]int64{345, 385}},
-		{"w.def", DTypeF8E4M3, [2]int64{385, 417}},
+		{"w.mx", DTypeU8, [2]int64{262, 326}},
+		{"w.nv.global_scale", DTypeF32, [2]int64{326, 330}},
+		{"w.nv.block_scale", DTypeF8E4M3, [2]int64{330, 333}},
+		{"w.nv", DTypeU8, [2]int64{333, 357}},
+		{"w.i4", DTypeU8, [2]int64{357, 373}},
+		{"w.i4.scale", DTypeF32, [2]int64{373, 377}},
+		{"w.skip", DTypeF32, [2]int64{377, 417}},
+		{"w.def", DTypeF8E4M3, [2]int64{417, 449}},
 	})
 
 	// Report fields per resolved target: only convrot and nvfp4 carry a

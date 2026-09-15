@@ -90,16 +90,16 @@ func TestPlanShardOutput(t *testing.T) {
 			def:  TargetMxFP4,
 			want1: []outEntry{
 				{nameUpProj + ".block_scale", DTypeU8, [2]int64{0, 1}},
-				{nameUpProj, DTypeU8, [2]int64{1, 5}},
-				{nameQProj + ".block_scale", DTypeU8, [2]int64{5, 6}},
-				{nameQProj, DTypeU8, [2]int64{6, 8}},
+				{nameUpProj, DTypeU8, [2]int64{1, 9}},
+				{nameQProj + ".block_scale", DTypeU8, [2]int64{9, 10}},
+				{nameQProj, DTypeU8, [2]int64{10, 14}},
 			},
 			want2: []outEntry{
 				{nameNorm + ".block_scale", DTypeU8, [2]int64{0, 1}},
-				{nameNorm, DTypeU8, [2]int64{1, 3}},
-				{namePosIDs, DTypeI32, [2]int64{3, 19}},
+				{nameNorm, DTypeU8, [2]int64{1, 5}},
+				{namePosIDs, DTypeI32, [2]int64{5, 21}},
 			},
-			wantTot: 27,
+			wantTot: 35,
 		},
 		{
 			name: "nvfp4 (global + block scales before owner)",
@@ -231,24 +231,38 @@ func TestPlanShardOutput(t *testing.T) {
 	}
 }
 
-// TestPlanShardOutputPackedTargets pins the spec byte-count invariant in
-// every output shard header for the packed 4-bit targets - the
-// shardout.go emission site's counterpart of TestConvertOddPackedTargets
-// (which covers the merged-file site). Every converted tensor in the
-// multi fixture carries packed U8 data, so its shard header must store
-// the packed (halved) shape; the I32 buffer passes through unchanged.
-func TestPlanShardOutputPackedTargets(t *testing.T) {
+// TestPlanShardOutput4BitTargets pins the spec byte-count invariant in
+// every output shard header for the 4-bit targets - the shardout.go
+// emission site's counterpart of TestConvertOddPackedTargets (which
+// covers the merged-file site). The packed targets (nvfp4, int4) store
+// the halved shape in the shard header; mxfp4 stores the source shape
+// (unpacked, one code byte per element); the I32 buffer passes through
+// unchanged.
+func TestPlanShardOutput4BitTargets(t *testing.T) {
 	inIdx, err := LoadIndex(filepath.Join(fixtureDir, fixtureIndexName))
 	if err != nil {
 		t.Fatalf("LoadIndex: %v", err)
 	}
 	for _, tc := range []struct {
-		name   string
-		target TargetKind
+		name       string
+		target     TargetKind
+		ownerShape map[string][]int64 // per-target owner header shapes
 	}{
-		{"mxfp4", TargetMxFP4},
-		{"nvfp4", TargetNVFP4},
-		{"int4", TargetInt4},
+		{"mxfp4", TargetMxFP4, map[string][]int64{
+			nameUpProj: {2, 4}, // source shape kept (unpacked)
+			nameQProj:  {2, 2},
+			nameNorm:   {4},
+		}},
+		{"nvfp4", TargetNVFP4, map[string][]int64{
+			nameUpProj: {2, 2}, // packed: last dim halved
+			nameQProj:  {2, 1},
+			nameNorm:   {2},
+		}},
+		{"int4", TargetInt4, map[string][]int64{
+			nameUpProj: {2, 2},
+			nameQProj:  {2, 1},
+			nameNorm:   {2},
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			plans, _, err := planModel(ConvertOptions{
@@ -271,14 +285,10 @@ func TestPlanShardOutputPackedTargets(t *testing.T) {
 				checkSpecInvariant(t, sh.Header)
 				checkContiguous(t, sh.Header)
 			}
-			// Packed owners carry the halved shape in their shard header
-			// ([2,4] -> [2,2], [2,2] -> [2,1], [4] -> [2]); the I32
-			// buffer keeps [4]; sibling shapes are unchanged (all block
-			// scales here are 1-element, so scalar []).
+			// Owner shapes are per-target (see tc.ownerShape); the I32
+			// buffer keeps [4]; sibling shapes are unchanged (all scales
+			// here are 1-element, so scalar []).
 			wantShape := map[string][]int64{
-				nameUpProj:                   {2, 2},
-				nameQProj:                    {2, 1},
-				nameNorm:                     {2},
 				namePosIDs:                   {4},
 				nameUpProj + ".scale":        {},
 				nameQProj + ".scale":         {},
@@ -289,6 +299,9 @@ func TestPlanShardOutputPackedTargets(t *testing.T) {
 				nameUpProj + ".global_scale": {},
 				nameQProj + ".global_scale":  {},
 				nameNorm + ".global_scale":   {},
+			}
+			for name, shape := range tc.ownerShape {
+				wantShape[name] = shape
 			}
 			for _, sh := range shards {
 				for _, e := range sh.Header.Tensors {

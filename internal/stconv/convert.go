@@ -70,7 +70,7 @@ type tensorPlan struct {
 	numElems        int64
 	target          TargetKind
 	outDType        DType
-	outShape        []int64 // output header shape (packed/halved for the 4-bit packed targets, source shape otherwise)
+	outShape        []int64 // output header shape (packed/halved for the packed 4-bit targets int4/nvfp4, source shape otherwise)
 	outLen          int64   // planned output byte length of this tensor (sibling tensors not included)
 	protectReason   string  // non-empty => the passthrough came from the default protection policy, not from config/default or a mechanical constraint
 	protectOverride bool    // explicit config rule converted a tensor the policy would protect; surfaced in TensorStat for the CLI warning
@@ -152,7 +152,7 @@ func planSiblings(target TargetKind, shape []int64, numElems int64) []sib {
 }
 
 // packedOwnerShape returns the header shape for a packed 4-bit owner
-// tensor (int4/mxfp4/nvfp4) whose data stores 2 elements per U8 byte:
+// tensor (int4/nvfp4) whose data stores 2 elements per U8 byte:
 // prod(result) == (numElems+1)/2, the spec byte-count invariant.
 //
 // The rule is GPTQ/AWQ-style: a zero-element tensor keeps its shape
@@ -665,10 +665,20 @@ func planTensor(opts ConvertOptions, name string, info TensorInfo, srcShard int,
 		case TargetInt8ConvRot:
 			plan.outDType = DTypeI8
 			plan.outLen = numElems // 1 byte/elem
-		case TargetInt4, TargetMxFP4, TargetNVFP4:
+		case TargetInt4, TargetNVFP4:
 			plan.outDType = DTypeU8
 			plan.outLen = (numElems + 1) / 2 // 2 elements packed per byte
 			plan.outShape = packedOwnerShape(info.Shape, numElems)
+		case TargetMxFP4:
+			// Unpacked, unlike int4/nvfp4: one E2M1 code per U8 byte, so
+			// the owner's header keeps the SOURCE shape. Standard loaders
+			// (transformers' from_pretrained) match each checkpoint tensor
+			// against the model parameter's shape; a halved packed shape is
+			// a size mismatch that aborts the load. The dequantizing
+			// consumer applies the E2M1 LUT and the ".block_scale" sibling
+			// per 32-element block: value = e2m1(code) * 2^(e8m0(scale)-127).
+			plan.outDType = DTypeU8
+			plan.outLen = numElems // 1 byte/elem (unpacked code)
 		default:
 			return plan, fmt.Errorf("tensor %q: unhandled target kind %v", name, target)
 		}
@@ -798,14 +808,12 @@ type passScratch struct {
 	// packedInt4 is the int4 packed output (2 elements per byte), max
 	// window.
 	packedInt4 []byte
-	// mxfp4Scales / mxfp4Packed are the mxfp4 block passes' per-chunk
-	// scale bytes (one E8M0 per 32-element block) and packed output.
+	// mxfp4Scales / mxfp4Codes are the mxfp4 block passes' per-chunk
+	// scale bytes (one E8M0 per 32-element block) and unpacked E2M1
+	// codes (one byte per element - see the TargetMxFP4 case in
+	// planTensor for why mxfp4 is not packed 2-per-byte).
 	mxfp4Scales []byte
-	mxfp4Packed []byte
-	// mxfp4Qs is the mxfp4 data pass' per-worker quantized-value
-	// scratch: one slice per fan-out worker (bounded by the CPU count,
-	// never the chunk or tensor), each at most mxfp4Block uint8.
-	mxfp4Qs [][]uint8
+	mxfp4Codes  []byte
 	// nvfp4Scales / nvfp4Packed / nvfp4Qs are the nvfp4 counterparts
 	// (one E4M3 scale per 16-element block).
 	nvfp4Scales []byte
@@ -838,8 +846,7 @@ func maxWindowElems(chunkElems int) int64 {
 //	+ w * 4                            fbuf (f32 decode)
 //	+ w                                out (1 byte/elem)
 //	+ (w+1)/2                          packedInt4 (2 elems/byte)
-//	+ w/32 + (w+1)/2                   mxfp4Scales + mxfp4Packed
-//	+ max(1, parallelism(w/32)) * 32   mxfp4Qs (per worker, mxfp4Block)
+//	+ w/32 + w                         mxfp4Scales + mxfp4Codes (1 byte/elem)
 //	+ w/16 + (w+1)/2                   nvfp4Scales + nvfp4Packed
 //	+ max(1, parallelism(w/16)) * 16   nvfp4Qs (per worker, nvfp4Block)
 //	+ w * 4                            convrotGroups (one f32/elem)
@@ -854,8 +861,7 @@ func passScratchSize(chunkElems int) int64 {
 		w*4 +
 		w +
 		(w+1)/2 +
-		w/mxfp4Block + (w+1)/2 +
-		int64(max(1, parallelism(int(w/mxfp4Block))))*mxfp4Block +
+		w/mxfp4Block + w +
 		w/nvfp4Block + (w+1)/2 +
 		int64(max(1, parallelism(int(w/nvfp4Block))))*nvfp4Block +
 		w*4 +
@@ -874,15 +880,11 @@ func newPassScratch(chunkElems int) *passScratch {
 		out:           make([]byte, w),
 		packedInt4:    make([]byte, (w+1)/2),
 		mxfp4Scales:   make([]byte, w/mxfp4Block),
-		mxfp4Packed:   make([]byte, (w+1)/2),
+		mxfp4Codes:    make([]byte, w),
 		nvfp4Scales:   make([]byte, w/nvfp4Block),
 		nvfp4Packed:   make([]byte, (w+1)/2),
 		convrotGroups: make([][convrotGroup]float32, w/convrotGroup),
 		results:       make([]float32, max(1, parallelism(int(w)))),
-	}
-	sc.mxfp4Qs = make([][]uint8, max(1, parallelism(int(w/mxfp4Block))))
-	for i := range sc.mxfp4Qs {
-		sc.mxfp4Qs[i] = make([]uint8, mxfp4Block)
 	}
 	sc.nvfp4Qs = make([][]uint8, max(1, parallelism(int(w/nvfp4Block))))
 	for i := range sc.nvfp4Qs {
