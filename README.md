@@ -307,22 +307,27 @@ runs, and watch peak RSS stay flat (see Memory behavior above).
 
 ## How conversion works
 
-- **fp8 (e4m3 / e5m2)**: values are cast directly, bit-for-bit per the OCP
-  8-bit float spec (the same layouts as PyTorch's `torch.float8_e4m3fn` /
-  `torch.float8_e5m2`, and ONNX's `Float8E4M3FN` / `Float8E5M2`). No
-  scaling is applied. The mantissa is rounded half-away-from-zero - this
-  matches the PyTorch/ONNX *layouts* but not their cast *bytes* at exact
-  mantissa midpoints, where torch rounds to nearest-even (RNE);
-  `f32ToE4M3RNE` (used only for NVFP4 block scales) is the RNE variant.
-  `e4m3` gives more mantissa precision and a max magnitude of 448, but
-  has no Inf: magnitudes beyond 448 encode to `0x7F`, the e4m3fn NaN
-  pattern (a dequantizing loader reads NaN, not 448), and tiny magnitudes
-  flush to zero. `e5m2` gives more exponent range (max magnitude 57344,
-  supports Inf) at the cost of precision; its overflow encodes to +/-Inf,
-  which stays accurate.
+- **fp8 (e4m3 / e5m2)**: values are cast directly, bit-for-bit per the
+  OCP 8-bit float spec (the same layouts as PyTorch's
+  `torch.float8_e4m3fn` / `torch.float8_e5m2`, and ONNX's
+  `Float8E4M3FN` / `Float8E5M2`). No scaling is applied. `e4m3` rounds
+  the mantissa to nearest-even (RNE) exactly like torch's
+  `float8_e4m3fn` cast - the output bytes are bit-identical to torch's
+  for every f32 input, including the edge behavior: `e4m3` gives more
+  mantissa precision and a max magnitude of 448, but has no Inf:
+  magnitudes beyond 448 and +/-Inf saturate to 448 (`0x7E`), NaN encodes
+  to `0x7F` (the e4m3fn NaN pattern), and tiny magnitudes flush to zero.
+  `e5m2` also rounds the mantissa to nearest-even (RNE) exactly like
+  torch's `float8_e5m2` cast - bit-identical bytes for every f32 input;
+  it gives more exponent range (max magnitude 57344, supports Inf) at
+  the cost of precision, and its overflow encodes to +/-Inf, which stays
+  accurate.
 - **int8**: quantized per-tensor, symmetric, using
-  `scale = max(abs(tensor)) / 127`, `q = round(x / scale)` clamped to
-  `[-127, 127]`. Since int8 has no implicit scale, a small sibling scalar
+  `scale = max(abs(tensor)) / 127`, `q = round-to-nearest-even(x / scale)`
+  (torch.round semantics) clamped to `[-127, 127]` - bit-identical to the
+  torch reference pipeline (`t.abs().max()/127`,
+  `torch.round(t/scale).clamp(-127,127)`) including the F32 `.scale`
+  sibling bytes. Since int8 has no implicit scale, a small sibling scalar
   tensor named `"<original_name>.scale"` (dtype `F32`) is added next to
   each quantized weight so it can be dequantized later. There's no
   standardized safetensors field for this - storing a scale tensor is the
@@ -331,7 +336,9 @@ runs, and watch peak RSS stay flat (see Memory behavior above).
 - **int8_convrot**: per `int8_convrot_guide.md` - each 256-element row-major
   group is rotated by the orthonormal regular Hadamard (y = H_256·x/16)
   **before** quantization; per-row symmetric int8 scale = `rowMax/127`
-  (row = first dimension); values clamped to `[-127, 127]`. This is a
+  (row = first dimension); values rounded with the same
+  round-to-nearest-even as plain int8 (the rotation itself is unchanged)
+  and clamped to `[-127, 127]`. This is a
   **value-changing conversion**: the output weights are the *rotated*
   weights - a loader must apply the same Hadamard rotation to activations
   at inference time (serving-side pairing, out of scope for this tool).
@@ -382,8 +389,10 @@ runs, and watch peak RSS stay flat (see Memory behavior above).
 - `internal/stconv/dtype.go` - float32 <-> {float16, bfloat16,
   float8_e4m3fn, float8_e5m2, int8, e2m1 (FP4 element), e8m0 (MXFP4 block
   scale), int4} conversions, implemented from the bit-level spec of each
-  format (including the RNE e4m3 encoder `f32ToE4M3RNE` used only by the
-  NVFP4 block-scale path).
+  format (the e4m3 and e5m2 encoders are round-to-nearest-even and
+  bit-identical to torch's `float8_e4m3fn` / `float8_e5m2` casts, and the
+  int8 quantizer matches the torch reference pipeline's `torch.round`;
+  the e4m3 encoder also serves the NVFP4 block-scale path).
 - `internal/stconv/dtype_test.go` - unit tests checking each conversion
   against known reference values (e.g. e4m3 max magnitude 448, e5m2 max
   magnitude 57344, round-trip tolerances).
@@ -440,12 +449,6 @@ runs, and watch peak RSS stay flat (see Memory behavior above).
 
 ## Known limitations / next steps
 
-- Unify fp8 rounding on RNE with a golden refresh - deliberately not done
-  in the review-fix round. The `fp8_e4m3`/`fp8_e5m2` casts round the
-  mantissa half-away-from-zero; switching them to round-to-nearest-even
-  (matching torch's cast bytes at exact mantissa midpoints) is a behavior
-  change that requires regenerating the fp8 golden tests, so it is
-  deferred as an explicit decision (see How conversion works).
 - int8 scale is a single scalar per tensor (no per-channel/group-wise
   quantization yet) - per-channel scales would meaningfully improve
   accuracy for weights with outlier channels and would be the natural

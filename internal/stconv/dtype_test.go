@@ -101,79 +101,151 @@ func TestF8E4M3Max(t *testing.T) {
 	if got := f8E4M3ToF32(f32ToF8E4M3(1.0)); got != 1.0 {
 		t.Errorf("expected exact 1.0, got %v", got)
 	}
-	// Values well beyond range should land on the NaN pattern.
+	// Values beyond 448 saturate to 448, the max finite value - torch's
+	// overflow behavior (e4m3fn has no Inf; the 0x7F NaN pattern is
+	// reserved for NaN inputs).
 	got = f8E4M3ToF32(f32ToF8E4M3(100000))
-	if !math.IsNaN(float64(got)) {
-		t.Errorf("expected NaN for large overflow, got %v", got)
+	if !almostEqual(got, 448, 0.01) {
+		t.Errorf("expected 448 for large overflow, got %v", got)
 	}
-	// +/-Inf saturate to the NaN pattern, explicitly (B4 audit): pre-fix,
-	// +Inf fell through Frexp (Frexp(Inf) = (Inf, 0)) and mis-encoded to
-	// 0x38 = 1.0 instead of the convention's sentinel.
-	if got := f32ToF8E4M3(float32(math.Inf(1))); got != 0x7F {
-		t.Errorf("f32ToF8E4M3(+Inf) = %02x, want 7f", got)
+	// +/-Inf saturate to +/-448, matching torch's cast (pinned against
+	// torch 2.14.0+cpu).
+	if got := f32ToF8E4M3(float32(math.Inf(1))); got != 0x7E {
+		t.Errorf("f32ToF8E4M3(+Inf) = %02x, want 7e", got)
 	}
-	if got := f32ToF8E4M3(float32(math.Inf(-1))); got != 0xFF {
-		t.Errorf("f32ToF8E4M3(-Inf) = %02x, want ff", got)
+	if got := f32ToF8E4M3(float32(math.Inf(-1))); got != 0xFE {
+		t.Errorf("f32ToF8E4M3(-Inf) = %02x, want fe", got)
 	}
 }
 
-func TestE4M3RNEPinned(t *testing.T) {
-	// Pinned values for the RNE e4m3 encoder used by the NVFP4 block-scale
-	// path. Note the plan's original "0.015625->0x01" is a typo: 0.015625 =
+func TestF8E4M3Pinned(t *testing.T) {
+	// Pinned values for the e4m3 encoder, verified against torch's
+	// float8_e4m3fn cast (torch 2.14.0+cpu): RNE mantissa rounding,
+	// overflow and +/-Inf saturate to 448, NaN -> 0x7F. Note 0.015625 =
 	// 2^-6 is the smallest NORMAL (0x08); 0x01 is the smallest SUBNORMAL
-	// (0.001953125 = 2^-9). Both are pinned here.
+	// (0.001953125 = 2^-9).
 	cases := []struct {
 		f    float32
 		want uint8
 	}{
 		{0, 0x00},
-		{0.001953125, 0x01}, // 2^-9, smallest subnormal
-		{0.015625, 0x08},    // 2^-6, smallest normal
+		{0.001953125, 0x01},  // 2^-9, smallest subnormal
+		{0.0009765625, 0x00}, // half a subnormal step: RNE tie -> 0 (even)
+		{0.0029296875, 0x02}, // 1.5*2^-9: RNE tie -> even 2
+		{0.013671875, 0x07},  // 7*2^-9
+		{0.0146484375, 0x08}, // 7.5*2^-9: RNE tie -> smallest normal
+		{0.015625, 0x08},     // 2^-6, smallest normal
 		{1.0, 0x38},
-		{1.5625, 0x3C}, // midpoint between 1.5 (man 4) and 1.625 (man 5): RNE -> man 4
+		{1.3125, 0x3A}, // midpoint, mantissa 2.5: RNE -> even 2
+		{1.5625, 0x3C}, // midpoint, mantissa 4.5: RNE -> even 4
 		{448, 0x7E},    // max finite
 		{448.5, 0x7E},  // nearest finite (rounds to 448)
-		{512, 0x7F},    // saturate
-		{float32(math.Inf(1)), 0x7F},
+		{464, 0x7E},    // 448/480 midpoint: RNE -> 448 (even mantissa)
+		{480, 0x7E},    // overflow: saturate to 448
+		{512, 0x7E},
+		{float32(math.Inf(1)), 0x7E},
+		{float32(math.Inf(-1)), 0xFE},
 		{math.Float32frombits(0x7fc00000), 0x7F}, // NaN
+		{math.Float32frombits(0xffc00000), 0xFF}, // -NaN
 	}
 	for _, c := range cases {
-		if got := f32ToE4M3RNE(c.f); got != c.want {
-			t.Errorf("f32ToE4M3RNE(%v) = %02x, want %02x", c.f, got, c.want)
+		if got := f32ToF8E4M3(c.f); got != c.want {
+			t.Errorf("f32ToF8E4M3(%v) = %02x, want %02x", c.f, got, c.want)
 		}
 	}
 }
 
-func TestE4M3RNEContrastWithHalfAway(t *testing.T) {
-	// This contrast documents why two e4m3 encoders exist. At exact mantissa
-	// midpoints f32ToF8E4M3 (round-half-away, golden-pinned) and
-	// f32ToE4M3RNE (round-to-nearest-even) diverge:
-	//   1.3125: mantissa 2.5 -> half-away 3 (0x3B) vs RNE 2 (0x3A)
-	//   1.5625: mantissa 4.5 -> half-away 5 (0x3D) vs RNE 4 (0x3C)
-	if got := f32ToF8E4M3(1.3125); got != 0x3B {
-		t.Errorf("f32ToF8E4M3(1.3125) = %02x, want %02x (half-away)", got, 0x3B)
+// TestF8E4M3ExhaustiveOracle checks f32ToF8E4M3 against the Frexp-based
+// RNE oracle for every f32 magnitude (all 2^24 non-negative bit patterns
+// from +0 to the largest finite, both signs) plus the Inf/NaN patterns -
+// the whole f32 domain, no sampling.
+func TestF8E4M3ExhaustiveOracle(t *testing.T) {
+	bads := 0
+	check := func(s uint32) {
+		f := math.Float32frombits(s)
+		if got, want := f32ToF8E4M3(f), f32ToF8E4M3Ref(f); got != want {
+			if bads < 20 {
+				t.Errorf("f32ToF8E4M3(%08x) = %02x, want %02x (oracle)", s, got, want)
+			}
+			bads++
+		}
 	}
-	if got := f32ToE4M3RNE(1.3125); got != 0x3A {
-		t.Errorf("f32ToE4M3RNE(1.3125) = %02x, want %02x (RNE)", got, 0x3A)
+	for p := uint32(0); p <= 0x7F7FFFFF; p++ {
+		check(p)
+		check(p | 0x80000000)
 	}
-	if got := f32ToF8E4M3(1.5625); got != 0x3D {
-		t.Errorf("f32ToF8E4M3(1.5625) = %02x, want %02x (half-away)", got, 0x3D)
+	for _, s := range []uint32{0x7F800000, 0xFF800000, 0x7FC00000, 0xFFC00000,
+		0x7F800001, 0xFF800001, 0x7FFFFFFF, 0xFFFFFFFF} {
+		check(s)
 	}
-	if got := f32ToE4M3RNE(1.5625); got != 0x3C {
-		t.Errorf("f32ToE4M3RNE(1.5625) = %02x, want %02x (RNE)", got, 0x3C)
+	if bads > 0 {
+		t.Errorf("%d total mismatches against the oracle", bads)
 	}
 }
 
-func TestE4M3RNEAgreesWithHalfAwayOnNonTies(t *testing.T) {
-	// On every non-tie input the two encoders must emit identical bytes.
-	// (Values like 100 = 1.5625*2^6 or 200 = 1.5625*2^7 ARE exact mantissa
-	// midpoints and legitimately differ - see the contrast test above.)
-	nonTies := []float32{0.015625, 0.03, 0.5, 0.75, 1.0, 1.1, 2.0, 4.0, 6.0,
-		3.33, 5.5, 10.25, 100.1, 200.3, 447.0, 448.0, 448.5, -1.0, -5.5, -12.4, -448}
-	for _, f := range nonTies {
-		if a, b := f32ToF8E4M3(f), f32ToE4M3RNE(f); a != b {
-			t.Errorf("non-tie %v: half-away %02x != RNE %02x", f, a, b)
+func TestF8E5M2Pinned(t *testing.T) {
+	// Pinned values for the e5m2 encoder, verified against torch's
+	// float8_e5m2 cast (torch 2.14.0+cpu): RNE mantissa rounding in both
+	// the normal and subnormal paths, overflow and +/-Inf -> +/-Inf
+	// (0x7C), NaN -> 0x7F. Note 2^-14 is the smallest NORMAL (0x04);
+	// 2^-16 is the smallest SUBNORMAL (0x01).
+	cases := []struct {
+		f    float32
+		want uint8
+	}{
+		{0, 0x00},
+		{0.00000762939453125, 0x00}, // 0.5*2^-16, half a subnormal step: RNE tie -> 0 (even)
+		{0.0000152587890625, 0x01},  // 2^-16, smallest subnormal
+		{0.00002288818359375, 0x02}, // 1.5*2^-16: RNE tie -> even 2
+		{0.0000457763671875, 0x03},  // 3*2^-16
+		{0.00005340576171875, 0x04}, // 3.5*2^-16: RNE tie -> smallest normal
+		{0.00006103515625, 0x04},    // 2^-14, smallest normal
+		{1.0, 0x3C},
+		{1.125, 0x3C}, // tie 1.0/1.25: RNE -> even man 0
+		{1.375, 0x3E}, // tie 1.25/1.5: RNE -> even man 2
+		{1.625, 0x3E}, // tie 1.5/1.75: RNE -> even man 2
+		{57344, 0x7B}, // max finite
+		{57344.0001, 0x7B},
+		{61440, 0x7C}, // 57344/Inf tie: RNE -> Inf (man 0 even)
+		{65536, 0x7C},
+		{100000, 0x7C},
+		{float32(math.Inf(1)), 0x7C},
+		{float32(math.Inf(-1)), 0xFC},
+		{math.Float32frombits(0x7fc00000), 0x7F}, // NaN
+		{math.Float32frombits(0xffc00000), 0xFF}, // -NaN
+	}
+	for _, c := range cases {
+		if got := f32ToF8E5M2(c.f); got != c.want {
+			t.Errorf("f32ToF8E5M2(%v) = %02x, want %02x", c.f, got, c.want)
 		}
+	}
+}
+
+// TestF8E5M2ExhaustiveOracle checks f32ToF8E5M2 against the Frexp-based
+// RNE oracle for every f32 magnitude (all 2^24 non-negative bit patterns
+// from +0 to the largest finite, both signs) plus the Inf/NaN patterns -
+// the whole f32 domain, no sampling.
+func TestF8E5M2ExhaustiveOracle(t *testing.T) {
+	bads := 0
+	check := func(s uint32) {
+		f := math.Float32frombits(s)
+		if got, want := f32ToF8E5M2(f), f32ToF8E5M2Ref(f); got != want {
+			if bads < 20 {
+				t.Errorf("f32ToF8E5M2(%08x) = %02x, want %02x (oracle)", s, got, want)
+			}
+			bads++
+		}
+	}
+	for p := uint32(0); p <= 0x7F7FFFFF; p++ {
+		check(p)
+		check(p | 0x80000000)
+	}
+	for _, s := range []uint32{0x7F800000, 0xFF800000, 0x7FC00000, 0xFFC00000,
+		0x7F800001, 0xFF800001, 0x7FFFFFFF, 0xFFFFFFFF} {
+		check(s)
+	}
+	if bads > 0 {
+		t.Errorf("%d total mismatches against the oracle", bads)
 	}
 }
 
@@ -193,9 +265,28 @@ func TestF8E5M2Max(t *testing.T) {
 	}
 }
 
-// f32ToF8E4M3Ref is the pre-S3 Frexp/Round e4m3 encoder, kept verbatim as
-// the oracle for TestF32ToF8EncodersOracle. It must not be updated when
-// f32ToF8E4M3 changes.
+// rneRoundF64 rounds a non-negative float64 to the nearest integer, ties
+// to even (round-to-nearest-even). The caller must pass a value whose
+// fractional part is exact (see f32ToF8E4M3Ref for why float64 suffices).
+func rneRoundF64(t float64) int32 {
+	q := int32(t)
+	frac := t - float64(q)
+	switch {
+	case frac > 0.5:
+		q++
+	case frac == 0.5 && q%2 == 1:
+		q++
+	}
+	return q
+}
+
+// f32ToF8E4M3Ref is the Frexp-based RNE e4m3 oracle for
+// TestF32ToF8EncodersOracle and TestF8E4M3ExhaustiveOracle: an independent,
+// straightforward implementation of the same function as f32ToF8E4M3 -
+// round-to-nearest-even mantissa, overflow and +/-Inf saturating to 448
+// (0x7E), NaN -> 0x7F - computed in float64, where an f32 significand is
+// exact enough for tie detection. The bit-manipulation encoder must agree
+// with it on every f32 input.
 func f32ToF8E4M3Ref(f float32) uint8 {
 	sign := uint8(0)
 	if math.Signbit(float64(f)) {
@@ -206,8 +297,8 @@ func f32ToF8E4M3Ref(f float32) uint8 {
 	if math.IsNaN(float64(f)) {
 		return sign | 0x7F
 	}
-	if math.IsInf(float64(f), 0) {
-		return sign | 0x7F // no Inf; saturate into the NaN pattern
+	if math.IsInf(af, 1) {
+		return sign | 0x7E // no Inf; saturate to the max finite value
 	}
 	if af == 0 {
 		return sign
@@ -224,8 +315,8 @@ func f32ToF8E4M3Ref(f float32) uint8 {
 
 	if biasedExp < 1 {
 		// Subnormal range; smallest normal is 2^(1-bias) = 2^-6.
-		val := af / math.Pow(2, 1-bias) * denom
-		man := int32(math.Round(val))
+		t := af / math.Pow(2, 1-bias) * denom
+		man := rneRoundF64(t)
 		if man <= 0 {
 			return sign
 		}
@@ -235,27 +326,27 @@ func f32ToF8E4M3Ref(f float32) uint8 {
 		return sign | uint8(man)
 	}
 
-	manF := math.Round((m - 1) * denom)
+	manF := rneRoundF64((m - 1) * denom)
 	if manF >= denom {
 		manF = 0
 		biasedExp++
 	}
 	const maxExp = 0xF // 4 exponent bits, all-ones is usable except mantissa==7
-	if biasedExp > maxExp {
-		// True overflow (beyond even the NaN-adjacent max): saturate into
-		// the NaN pattern, since e4m3fn has no infinity to represent this.
-		return sign | 0x7F
-	}
-	if biasedExp == maxExp && manF >= 7 {
-		// This exact bit pattern is reserved for NaN.
-		return sign | 0x7F
+	if biasedExp > maxExp || (biasedExp == maxExp && manF >= 7) {
+		// Overflow (or the mantissa whose pattern is reserved for NaN):
+		// saturate to 0x7E, the max finite value 448.
+		return sign | 0x7E
 	}
 	return sign | uint8(biasedExp)<<manBits | uint8(manF)
 }
 
-// f32ToF8E5M2Ref is the pre-S3 Frexp/Round e5m2 encoder, kept verbatim as
-// the oracle for TestF32ToF8EncodersOracle. It must not be updated when
-// f32ToF8E5M2 changes.
+// f32ToF8E5M2Ref is the Frexp-based RNE e5m2 oracle for
+// TestF32ToF8EncodersOracle and TestF8E5M2ExhaustiveOracle: an independent,
+// straightforward implementation of the same function as f32ToF8E5M2 -
+// round-to-nearest-even mantissa, NaN -> 0x7F, +/-Inf and overflow ->
+// +/-Inf (0x7C) - computed in float64, where an f32 significand is exact
+// enough for tie detection. The bit-manipulation encoder must agree with
+// it on every f32 input.
 func f32ToF8E5M2Ref(f float32) uint8 {
 	sign := uint8(0)
 	if math.Signbit(float64(f)) {
@@ -284,7 +375,7 @@ func f32ToF8E5M2Ref(f float32) uint8 {
 
 	if biasedExp < 1 {
 		val := af / math.Pow(2, 1-bias) * denom
-		man := int32(math.Round(val))
+		man := rneRoundF64(val)
 		if man <= 0 {
 			return sign
 		}
@@ -294,7 +385,7 @@ func f32ToF8E5M2Ref(f float32) uint8 {
 		return sign | uint8(man)
 	}
 
-	manF := math.Round((m - 1) * denom)
+	manF := rneRoundF64((m - 1) * denom)
 	if manF >= denom {
 		manF = 0
 		biasedExp++
@@ -307,8 +398,9 @@ func f32ToF8E5M2Ref(f float32) uint8 {
 
 // fp8EdgeCorpus builds the structured edge corpus for
 // TestF32ToF8EncodersOracle: the subnormal/normal boundary regions of both
-// formats, exact mantissa midpoints at every f32 exponent (the half-away
-// ties), the saturation boundaries (+/-448 for e4m3, +/-57344 for e5m2) and
+// formats, exact mantissa midpoints at every f32 exponent (the RNE
+// ties), the saturation boundaries
+// (+/-448 for e4m3, +/-57344 for e5m2) and
 // their ULP neighbors, zero, f32 denormals, +/-Inf, NaN payloads, the
 // 0x7F/Inf-adjacent values, and the extremes.
 func fp8EdgeCorpus() []float32 {
@@ -328,7 +420,7 @@ func fp8EdgeCorpus() []float32 {
 	// e4m3: subnormal step 2^-9, smallest normal 2^-6, flush at 2^-10.
 	step4 := float32(math.Ldexp(1, -9))
 	for k := 0; k <= 16; k++ {
-		// Subnormal units k*2^-9 and the half-away ties (k+0.5)*2^-9.
+		// Subnormal units k*2^-9 and the RNE ties (k+0.5)*2^-9.
 		add(float32(k)*step4, (float32(k)+0.5)*step4)
 	}
 	ulpAround(float32(math.Ldexp(1, -10)), 4)             // flush boundary
@@ -348,7 +440,7 @@ func fp8EdgeCorpus() []float32 {
 	ulpAround(float32(math.Ldexp(1, -14)), 4)              // smallest normal
 	ulpAround(float32(1.5)*float32(math.Ldexp(1, -14)), 4) // 3.5-unit tie: rounds up into the smallest normal
 
-	// Exact mantissa midpoints at every f32 exponent (the half-away ties).
+	// Exact mantissa midpoints at every f32 exponent (the RNE ties).
 	// e4m3 midpoint at unbiased exponent e, k: (1+(k+0.5)/8)*2^e =
 	// (16+2k+1)*2^(e-4); e5m2: (1+(k+0.5)/4)*2^e = (8+2k+1)*2^(e-3).
 	// Both are odd*2^int, so exact in f32 across the whole exponent range
@@ -366,11 +458,11 @@ func fp8EdgeCorpus() []float32 {
 	// values.
 	ulpAround(448, 4) // e4m3 max finite
 	ulpAround(-448, 4)
-	ulpAround(464, 2) // 448/480 tie -> 0x7F
+	ulpAround(464, 2) // 448/480 tie -> 0x7E (448)
 	ulpAround(-464, 2)
-	ulpAround(480, 2) // the 0x7F pattern's value
+	ulpAround(480, 2) // overflow past the 448/480 tie -> 0x7E
 	ulpAround(-480, 2)
-	ulpAround(496, 2) // carry boundary -> 0x7F
+	ulpAround(496, 2) // carry boundary -> 0x7E
 	ulpAround(-496, 2)
 	ulpAround(57344, 4) // e5m2 max finite
 	ulpAround(-57344, 4)
@@ -418,12 +510,13 @@ func TestF32ToF8EncodersOracle(t *testing.T) {
 	}
 }
 
-// f32ToInt8Ref is the pre-S4 float64-based int8 quantizer (math.Round,
-// half-away-from-zero), kept verbatim as the oracle for
-// TestInt8Int4QuantizeOracle. S4 prototyped an f32-only rewrite that is
-// byte-identical to this reference but ~2.1x slower on this machine, so
-// f32ToInt8 keeps the float64 implementation and this ref currently
-// mirrors it; it must not be updated when f32ToInt8 changes.
+// f32ToInt8Ref is the RNE int8 oracle for TestInt8Int4QuantizeOracle and
+// TestF32ToInt8ExhaustiveOracle: an independent, straightforward
+// implementation of the same function as f32ToInt8 - round-to-nearest-
+// even on the f32 quotient, clamped to [-127,127], NaN -> 0, +/-Inf ->
+// +/-127, scale == 0 -> 0 - via rneRoundF64 on the clamped magnitude with
+// the sign re-applied (RNE is sign-symmetric). The float64 implementation
+// must agree with it on every input.
 func f32ToInt8Ref(f, scale float32) int8 {
 	if math.IsNaN(float64(f)) {
 		return 0
@@ -431,12 +524,22 @@ func f32ToInt8Ref(f, scale float32) int8 {
 	if scale == 0 {
 		return 0
 	}
-	q := math.Round(float64(f / scale))
-	if q > 127 {
-		q = 127
+	t := float64(f / scale)
+	if math.IsNaN(t) {
+		return 0
 	}
-	if q < -127 {
-		q = -127
+	// Clamp the float before rneRoundF64: |t| <= 127 keeps the int32
+	// conversion in range and maps +/-Inf to the bounds, as the
+	// production code does.
+	if t > 127 {
+		t = 127
+	}
+	if t < -127 {
+		t = -127
+	}
+	q := rneRoundF64(math.Abs(t))
+	if math.Signbit(t) {
+		q = -q
 	}
 	return int8(q)
 }
@@ -620,6 +723,89 @@ func TestF32ToInt8SpecialValues(t *testing.T) {
 		if got := f32ToInt8(c.in, scale); got != c.want {
 			t.Errorf("f32ToInt8(%v, %v) = %d, want %d", c.in, scale, got, c.want)
 		}
+	}
+}
+
+func TestF32ToInt8Pinned(t *testing.T) {
+	// Pinned at scale = 1 (quotient == value), torch-verified tie
+	// behavior: torch.round is RNE - 2.5 -> 2 (not math.Round's half-away
+	// 3), 3.5 -> 4, -2.5 -> -2, -3.5 -> -4.
+	cases := []struct {
+		in   float32
+		want int8
+	}{
+		{0, 0},
+		{0.5, 0}, // RNE tie -> even 0
+		{1.5, 2}, // RNE tie -> even 2
+		{2.5, 2}, // RNE tie -> even 2 (half-away would give 3)
+		{3.5, 4}, // RNE tie -> even 4
+		{5.5, 6}, // RNE tie -> even 6
+		{6.5, 6}, // RNE tie -> even 6
+		{126.5, 126},
+		{127, 127},
+		{127.5, 127}, // RNE would give 128, clamped to 127
+		{-0.5, 0},
+		{-1.5, -2},
+		{-2.5, -2}, // RNE tie -> even -2
+		{-3.5, -4}, // RNE tie -> even -4
+		{float32(math.Inf(1)), 127},
+		{float32(math.Inf(-1)), -127},
+		{math.Float32frombits(0x7fc00000), 0}, // NaN
+	}
+	for _, c := range cases {
+		if got := f32ToInt8(c.in, 1); got != c.want {
+			t.Errorf("f32ToInt8(%v, 1) = %d, want %d", c.in, got, c.want)
+		}
+	}
+	// scale == 0 -> 0 for any finite input.
+	if got := f32ToInt8(3.3, 0); got != 0 {
+		t.Errorf("f32ToInt8(3.3, 0) = %d, want 0", got)
+	}
+	// Non-unit scale: with scale = 2, 5.0 -> quotient 2.5 -> RNE tie to
+	// the even integer 2.
+	if got := f32ToInt8(5.0, 2); got != 2 {
+		t.Errorf("f32ToInt8(5.0, 2) = %d, want 2", got)
+	}
+	// Out-of-range quotients must clamp in float space (no out-of-range
+	// float->int conversion).
+	for _, c := range []struct {
+		f, scale float32
+		want     int8
+	}{
+		{1e30, 1, 127},
+		{-1e30, 1, -127},
+	} {
+		if got := f32ToInt8(c.f, c.scale); got != c.want {
+			t.Errorf("f32ToInt8(%g, %g) = %d, want %d", c.f, c.scale, got, c.want)
+		}
+	}
+}
+
+// TestF32ToInt8ExhaustiveOracle checks f32ToInt8 against the RNE oracle
+// for every f32 bit pattern (all 2^24 non-negative magnitudes, both
+// signs) at scale = 1.0 - where the quotient is exactly f (IEEE division
+// by 1.0 is exact), so the whole quotient domain is covered, no sampling.
+func TestF32ToInt8ExhaustiveOracle(t *testing.T) {
+	bads := 0
+	check := func(s uint32) {
+		f := math.Float32frombits(s)
+		if got, want := f32ToInt8(f, 1), f32ToInt8Ref(f, 1); got != want {
+			if bads < 20 {
+				t.Errorf("f32ToInt8(%08x, 1) = %d, want %d (oracle)", s, got, want)
+			}
+			bads++
+		}
+	}
+	for p := uint32(0); p <= 0x7F7FFFFF; p++ {
+		check(p)
+		check(p | 0x80000000)
+	}
+	for _, s := range []uint32{0x7F800000, 0xFF800000, 0x7FC00000, 0xFFC00000,
+		0x7F800001, 0xFF800001, 0x7FFFFFFF, 0xFFFFFFFF} {
+		check(s)
+	}
+	if bads > 0 {
+		t.Errorf("%d total mismatches against the oracle", bads)
 	}
 }
 

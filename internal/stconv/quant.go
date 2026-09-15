@@ -407,7 +407,7 @@ const nvfp4Block = 16
 //	pass 0: global max M (the S7 parallel chunked scan).
 //	pass 1 (w at the global-scale region): write alpha as a 4-byte LE
 //	F32 (once), then per block: RECOMPUTE blockMax and store
-//	f32ToE4M3RNE(blockMax/(6*alpha)) (alpha == 0 -> 0) in the chunk's
+//	f32ToF8E4M3(blockMax/(6*alpha)) (alpha == 0 -> 0) in the chunk's
 //	scales buffer; the chunk's scales are written in one call.
 //	pass 2 (data): per block: RECOMPUTE blockMax and the scale byte,
 //	s := decode(byte), q_i := f32ToE2M1(x_i/(alpha*s)) (alpha*s == 0
@@ -586,7 +586,7 @@ func streamNVFP4(r io.ReaderAt, w io.Writer, offset int64, srcDType DType, numEl
 		if alpha == 0 {
 			return 0
 		}
-		return f32ToE4M3RNE(blockMax(vals) / (6 * alpha))
+		return f32ToF8E4M3(blockMax(vals) / (6 * alpha))
 	}
 
 	// Pass 1: the 4-byte LE F32 global scale (written once), then one
@@ -706,7 +706,7 @@ func hadamard256(buf []float32) {
 // row-major order is rotated by the orthonormal Hadamard (hadamard256),
 // and each row (the first dimension; a 1-D tensor is one row) is
 // quantized symmetrically with scale = rowMax/127 over the ROTATED
-// values, using f32ToInt8 (half-away rounding, like the plain int8
+// values, using f32ToInt8 (RNE rounding, like the plain int8
 // target). This is a value-changing conversion: the bytes written are the
 // rotated weights, which a loader must pair with the matching activation
 // rotation at inference time.

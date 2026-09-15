@@ -876,7 +876,7 @@ func runNVFP4(t *testing.T, vals []float32, chunkElems int) ([]byte, float32) {
 // and the packed E2M1 data.
 func TestStreamNVFP4Pinned(t *testing.T) {
 	// 16-block with max 2688 = 6*448: M = 2688 -> alpha = 1 exactly;
-	// block scale = f32ToE4M3RNE(2688/(6*1)) = f32ToE4M3RNE(448) = 0x7E;
+	// block scale = f32ToF8E4M3(2688/(6*1)) = f32ToF8E4M3(448) = 0x7E;
 	// step alpha*s = 448, so the elements 2688, 448*4, 448*1.5, 448*0.5
 	// quantize to e2m1(6), e2m1(4), e2m1(1.5), e2m1(0.5) = 0x7, 0x6, 0x3,
 	// 0x1 and the rest to 0 -> data bytes 67 13 00...
@@ -911,7 +911,7 @@ func TestStreamNVFP4Pinned(t *testing.T) {
 	}
 
 	// 17 ones: M = 1 -> alpha = 1/2688; both blocks (16 + 1) get scale
-	// f32ToE4M3RNE(1/(6*alpha)) = f32ToE4M3RNE(448) = 0x7E; step
+	// f32ToF8E4M3(1/(6*alpha)) = f32ToF8E4M3(448) = 0x7E; step
 	// alpha*448 = 1/6, so every element quantizes to e2m1(6) = 0x07:
 	// 8 bytes of 0x77 plus one 0x07 (trailing pad nibble 0) = 9 data
 	// bytes, 2 scale entries.
@@ -1049,7 +1049,7 @@ func TestConvertNVFP4E2E(t *testing.T) {
 				bm = v
 			}
 		}
-		want := f32ToE4M3RNE(bm / (6 * wantAlpha))
+		want := f32ToF8E4M3(bm / (6 * wantAlpha))
 		if scales[b] != want {
 			t.Errorf("block %d: scale 0x%02x, want 0x%02x (blockMax %v)", b, scales[b], want, bm)
 		}
@@ -1317,7 +1317,7 @@ func refMxFP4Serial(vals []float32) []byte {
 
 // refNVFP4Serial is the serial (pre-parallelization) NVFP4 algorithm:
 // the 4-byte LE F32 global scale alpha = M/(6*448), then all
-// 16-element block scale bytes (f32ToE4M3RNE of blockMax/(6*alpha), 0
+// 16-element block scale bytes (f32ToF8E4M3 of blockMax/(6*alpha), 0
 // when alpha == 0; the ".block_scale" sibling), then the packed E2M1
 // data at the step alpha*s, each block's scale recomputed on the data
 // pass. TestMxFP4NVFP4ParallelMatchSerial pins the parallel streamNVFP4
@@ -1351,7 +1351,7 @@ func refNVFP4Serial(vals []float32) []byte {
 		blk := vals[i : i+cnt]
 		var code uint8
 		if alpha != 0 {
-			code = f32ToE4M3RNE(refBlockMax(blk) / (6 * alpha))
+			code = f32ToF8E4M3(refBlockMax(blk) / (6 * alpha))
 		}
 		out = append(out, code)
 	}
@@ -1363,7 +1363,7 @@ func refNVFP4Serial(vals []float32) []byte {
 		blk := vals[i : i+cnt]
 		var code uint8
 		if alpha != 0 {
-			code = f32ToE4M3RNE(refBlockMax(blk) / (6 * alpha))
+			code = f32ToF8E4M3(refBlockMax(blk) / (6 * alpha))
 		}
 		step := alpha * f8E4M3ToF32(code)
 		qv := make([]uint8, cnt)

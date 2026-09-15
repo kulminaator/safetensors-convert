@@ -39,9 +39,11 @@ Development proceeds in **phases**, and each phase is broken into small
    the change. A step without tests is not a finished step.
 3. **Tests must pass after every build.** Before a step is done:
    ```
-   gofmt -l . && go vet ./... && go build ./... && timeout 120 go test -timeout 60s ./...
+   gofmt -l . && go vet ./... && go build ./... && timeout 600 go test -timeout 300s ./...
    ```
-   All four must be clean. No "will fix the test later", no skipping tests,
+   All four must be clean. The suite takes ~2 minutes (the exhaustive
+   fp8/int8 oracle tests), so the timeouts below are sized from that
+   expected runtime (rule 7), not from the old sub-minute suite. No "will fix the test later", no skipping tests,
    no weakening assertions to make them pass.
 4. **No step merges on red.** A failing or newly flaky test blocks the next
    step. Fix it first.

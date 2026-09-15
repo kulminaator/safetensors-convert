@@ -8,8 +8,7 @@ import (
 // This file implements the production dtype conversions: decoders from
 // {float16, bfloat16, float8_e4m3fn, float8_e5m2} to float32, encoders from
 // float32 to {float8_e4m3fn, float8_e5m2, int8, int4, e2m1}, the E8M0
-// block-scale codec, a round-to-nearest-even e4m3 encoder for the NVFP4
-// block-scale path, and the shared 4-bit nibble packing, using only the
+// block-scale codec, and the shared 4-bit nibble packing, using only the
 // standard library. The test-only round-trip/encoder counterparts (f32ToF16,
 // f32ToBF16, int8ToF32, int4ToF32, e2m1ToF32, unpackNibbles) live in
 // dtype_helpers_test.go.
@@ -35,9 +34,9 @@ import (
 //   - int8 (f32ToInt8): NaN -> 0; +/-Inf -> +/-127.
 //   - int4 (f32ToInt4RNE): NaN -> 0; +/-Inf -> +/-7.
 //   - e2m1 (f32ToE2M1): NaN -> 0x00 (no NaN code exists); +/-Inf -> +/-6.
-//   - e4m3fn (f32ToF8E4M3, f32ToE4M3RNE): NaN and +/-Inf -> the 0x7F
-//     pattern - the same sentinel finite overflow already saturates to,
-//     since e4m3fn has no infinity.
+//   - e4m3fn (f32ToF8E4M3): NaN -> the 0x7F NaN pattern; +/-Inf and
+//     magnitudes beyond 448 -> 0x7E, the max finite value 448 - torch's
+//     float8_e4m3fn saturation, since e4m3fn has no infinity.
 //   - e5m2 (f32ToF8E5M2): NaN -> the NaN pattern; +/-Inf -> the Inf
 //     pattern (e5m2 represents infinity, so it is kept, not clamped).
 //   - e8m0 (e8m0Encode, a scale codec): NaN and m <= 0 -> code 0 (scale
@@ -100,13 +99,14 @@ func bf16ToF32(bits uint16) float32 {
 
 // ---------- float8_e4m3fn ----------
 
-// f32ToF8E4M3 encodes f to e4m3fn with round-half-away-from-zero mantissa
-// rounding (deliberate; pinned by golden tests). It produces the same
-// layout as the PyTorch/ONNX e4m3fn, but at exact mantissa midpoints its
-// bytes differ from torch's RNE cast - f32ToE4M3RNE is the RNE variant,
-// used only for NVFP4 block scales. NaN and +/-Inf encode to the 0x7F
-// NaN pattern; magnitudes beyond 448 encode to 0x7F as well (e4m3fn has
-// no Inf), and tiny magnitudes flush to zero.
+// f32ToF8E4M3 encodes f to e4m3fn with round-to-nearest-even (RNE)
+// mantissa rounding - the same rounding as PyTorch's float8_e4m3fn cast,
+// so the output bytes are bit-identical to torch's for every f32 input
+// (pinned by the torch-verified values in dtype_test.go and by the
+// Frexp-based oracle over the whole f32 domain). NaN encodes to the 0x7F
+// NaN pattern; +/-Inf and magnitudes beyond 448 saturate to 0x7E, the max
+// finite value 448 - torch's overflow behavior, since e4m3fn has no Inf;
+// tiny magnitudes flush to zero.
 //
 // Pure bit manipulation, no Frexp/Round/Pow: the magnitude is read as the
 // 24-bit significand M (leading 1 explicit) and unbiased exponent e,
@@ -114,14 +114,15 @@ func bf16ToF32(bits uint16) float32 {
 // M's bits:
 //
 //   - normal (biasedExp = e+7 >= 1): the 3 mantissa bits are the top
-//     fraction bits, man>>20; the dropped low 20 bits round
-//     half-away-from-zero - up if dropped*2 >= 2^20 - and a carry (mantissa
-//     8) propagates into the exponent. biasedExp > 15, or biasedExp == 15
-//     with mantissa 7 (the reserved NaN pattern), saturates to 0x7F.
+//     fraction bits, man>>20; the dropped low 20 bits round RNE - up if
+//     dropped > 2^19, or dropped == 2^19 with an odd kept mantissa - and a
+//     carry (mantissa 8) propagates into the exponent. biasedExp > 15, or
+//     biasedExp == 15 with mantissa >= 7 (the 0x7F pattern is reserved
+//     for NaN), saturates to 0x7E, the max finite value.
 //   - subnormal (biasedExp < 1): the value in units of the smallest
 //     subnormal step 2^-9 is af/2^-9 = M/2^(14-e) - a right shift of M by
-//     14-e with the same half-away round on the dropped bits. e <= -11
-//     leaves it below half a step, which flushes to zero.
+//     14-e with the same RNE round on the dropped bits. e <= -11 leaves it
+//     below half a step, which flushes to zero.
 //
 // f32 subnormals (max magnitude (2^23-1)*2^-149) are far below half an
 // e4m3 subnormal step (2^-10), so they flush to zero as well.
@@ -133,9 +134,12 @@ func f32ToF8E4M3(f float32) uint8 {
 
 	switch {
 	case ef == 0xFF:
-		// NaN (man != 0) and +/-Inf (man == 0) both encode to the 0x7F
-		// pattern: e4m3fn has no Inf, and that pattern is its NaN.
-		return sign | 0x7F
+		if man == 0 {
+			// +/-Inf: e4m3fn has no Inf; saturate to the max finite
+			// value 448, matching torch's cast.
+			return sign | 0x7E
+		}
+		return sign | 0x7F // NaN
 	case ef == 0:
 		// +/-0 (man == 0) and f32 subnormals (man != 0) - the latter are
 		// below half the smallest e4m3 subnormal step - both encode to
@@ -156,8 +160,9 @@ func f32ToF8E4M3(f float32) uint8 {
 		}
 		M := man | 0x800000
 		q := M >> uint(d)
-		if M-(q<<uint(d)) >= 1<<uint(d-1) {
-			q++ // half-away-from-zero on the dropped bits
+		half := uint32(1) << uint(d-1)
+		if rem := M - (q << uint(d)); rem > half || (rem == half && q&1 == 1) {
+			q++ // RNE on the dropped bits
 		}
 		if q >= 8 {
 			return sign | 8 // rounds up into the smallest normal
@@ -166,116 +171,22 @@ func f32ToF8E4M3(f float32) uint8 {
 	}
 
 	manF := man >> 20 // top 3 bits of the 23-bit fraction
-	if (man&0xFFFFF)*2 >= 1<<20 {
-		manF++ // half-away-from-zero on the dropped low 20 bits
+	dropped := man & 0xFFFFF
+	if dropped > 0x80000 || (dropped == 0x80000 && manF&1 == 1) {
+		manF++ // RNE on the dropped low 20 bits
 	}
 	if manF >= 8 {
 		manF = 0
 		biasedExp++ // carry into the exponent
 	}
 	const maxExp = 0xF // 4 exponent bits, all-ones is usable except mantissa==7
-	if biasedExp > maxExp {
-		// True overflow (beyond even the NaN-adjacent max): saturate into
-		// the NaN pattern, since e4m3fn has no infinity to represent this.
-		return sign | 0x7F
-	}
-	if biasedExp == maxExp && manF >= 7 {
-		// This exact bit pattern is reserved for NaN.
-		return sign | 0x7F
+	if biasedExp > maxExp || (biasedExp == maxExp && manF >= 7) {
+		// Overflow (or the mantissa whose pattern is reserved for NaN):
+		// saturate to 0x7E, the max finite value 448 - torch's behavior;
+		// the 0x7F NaN pattern is reserved for NaN inputs only.
+		return sign | 0x7E
 	}
 	return sign | uint8(biasedExp)<<3 | uint8(manF)
-}
-
-// rneRound rounds a non-negative float64 to the nearest integer using
-// round-to-nearest-even (RNE): a fraction > 0.5 rounds up, and a fraction
-// exactly 0.5 rounds up only to an even integer (ties to even). The input
-// must be exact enough that the fractional part is computed without rounding
-// error (see f32ToE4M3RNE for why float64 suffices).
-func rneRound(t float64) int32 {
-	q := int32(t)
-	frac := t - float64(q)
-	switch {
-	case frac > 0.5:
-		q++
-	case frac == 0.5 && q%2 == 1:
-		q++
-	}
-	return q
-}
-
-// f32ToE4M3RNE encodes f to e4m3fn using round-to-nearest-even (RNE), the
-// same layout and edge behavior as f32ToF8E4M3 (no Inf; the 0x7F pattern is
-// the saturation/NaN marker; NaN input -> 0x7F; magnitudes beyond 448
-// saturate to 0x7F) but with true RNE mantissa rounding.
-//
-// Why a second e4m3 encoder exists: f32ToF8E4M3 rounds the mantissa with
-// math.Round, which is round-half-AWAY (e.g. mantissa units 2.5 -> 3). That
-// encoder's exact output bytes are pinned by the fp8_e4m3 golden tests, so it
-// must not change. The NVIDIA NVFP4 recipe, however, rounds per-block scales
-// to e4m3 with RNE, so the scale path needs this distinct encoder. The two
-// agree on every non-tie input and differ only at exact midpoints.
-//
-// RNE is applied in both the normal and subnormal paths by rounding
-// t = mantissa value in integer units (computed in float64, exact enough for
-// tie detection) with rneRound. In the normal path t = (m-1)*8 with m in
-// [1,2) in float64; in the subnormal path t is the value in units of the
-// smallest subnormal step (2^-6/8).
-func f32ToE4M3RNE(f float32) uint8 {
-	sign := uint8(0)
-	if math.Signbit(float64(f)) {
-		sign = 0x80
-	}
-	af := math.Abs(float64(f))
-
-	if math.IsNaN(float64(f)) {
-		return sign | 0x7F
-	}
-	if math.IsInf(af, 1) {
-		return sign | 0x7F // no Inf; saturate into the NaN pattern
-	}
-	if af == 0 {
-		return sign
-	}
-
-	const manBits = 3
-	const denom = 1 << manBits // 8
-	const bias = 7
-
-	frac, exp := math.Frexp(af)
-	m := frac * 2
-	e := int32(exp) - 1
-	biasedExp := e + bias
-
-	if biasedExp < 1 {
-		// Subnormal range; smallest normal is 2^(1-bias) = 2^-6.
-		t := af / math.Pow(2, 1-bias) * denom
-		man := rneRound(t)
-		if man <= 0 {
-			return sign
-		}
-		if man >= denom {
-			return sign | (1 << manBits) // rounds up into smallest normal
-		}
-		return sign | uint8(man)
-	}
-
-	t := (m - 1) * denom
-	manF := rneRound(t)
-	if manF >= denom {
-		manF = 0
-		biasedExp++
-	}
-	const maxExp = 0xF // 4 exponent bits, all-ones is usable except mantissa==7
-	if biasedExp > maxExp {
-		// True overflow (beyond even the NaN-adjacent max): saturate into
-		// the NaN pattern, since e4m3fn has no infinity to represent this.
-		return sign | 0x7F
-	}
-	if biasedExp == maxExp && manF >= 7 {
-		// This exact bit pattern is reserved for NaN.
-		return sign | 0x7F
-	}
-	return sign | uint8(biasedExp)<<manBits | uint8(manF)
 }
 
 func f8E4M3ToF32(bits uint8) float32 {
@@ -300,8 +211,11 @@ func f8E4M3ToF32(bits uint8) float32 {
 
 // ---------- float8_e5m2 ----------
 
-// f32ToF8E5M2 encodes f to e5m2 with round-half-away-from-zero mantissa
-// rounding (deliberate; pinned by golden tests). Same layout as PyTorch's
+// f32ToF8E5M2 encodes f to e5m2 with round-to-nearest-even (RNE)
+// mantissa rounding - the same rounding as PyTorch's float8_e5m2 cast,
+// so the output bytes are bit-identical to torch's for every f32 input
+// (pinned by the torch-verified values in dtype_test.go and by the
+// Frexp-based oracle over the whole f32 domain). Same layout as PyTorch's
 // torch.float8_e5m2 and ONNX's Float8E5M2. NaN encodes to the NaN pattern
 // (0x7F); +/-Inf encode to the Inf pattern (0x7C) - e5m2 represents
 // infinity, so it is kept, not clamped; magnitudes beyond 57344 encode to
@@ -313,13 +227,14 @@ func f8E4M3ToF32(bits uint8) float32 {
 // M's bits:
 //
 //   - normal (biasedExp = e+15 >= 1): the 2 mantissa bits are the top
-//     fraction bits, man>>21; the dropped low 21 bits round
-//     half-away-from-zero - up if dropped*2 >= 2^21 - and a carry
-//     (mantissa 4) propagates into the exponent. biasedExp >= 31
-//     saturates to +/-Inf.
+//     fraction bits, man>>21; the dropped low 21 bits round RNE - up if
+//     dropped > 2^20, or dropped == 2^20 with an odd kept mantissa - and a
+//     carry (mantissa 4) propagates into the exponent. biasedExp >= 31
+//     saturates to +/-Inf (the only overflow tie, 61440 between 57344 and
+//     Inf, goes to Inf under RNE - the same answer half-away gives).
 //   - subnormal (biasedExp < 1): the value in units of the smallest
 //     subnormal step 2^-16 is af/2^-16 = M/2^(7-e) - a right shift of M by
-//     7-e with the same half-away round on the dropped bits. e <= -18
+//     7-e with the same RNE round on the dropped bits. e <= -18
 //     leaves it below half a step, which flushes to zero.
 //
 // f32 subnormals (max magnitude (2^23-1)*2^-149) are far below half an
@@ -356,8 +271,9 @@ func f32ToF8E5M2(f float32) uint8 {
 		}
 		M := man | 0x800000
 		q := M >> uint(d)
-		if M-(q<<uint(d)) >= 1<<uint(d-1) {
-			q++ // half-away-from-zero on the dropped bits
+		half := uint32(1) << uint(d-1)
+		if rem := M - (q << uint(d)); rem > half || (rem == half && q&1 == 1) {
+			q++ // RNE on the dropped bits
 		}
 		if q >= 4 {
 			return sign | 4 // rounds up into the smallest normal
@@ -366,8 +282,9 @@ func f32ToF8E5M2(f float32) uint8 {
 	}
 
 	manF := man >> 21 // top 2 bits of the 23-bit fraction
-	if (man&0x1FFFFF)*2 >= 1<<21 {
-		manF++ // half-away-from-zero on the dropped low 21 bits
+	dropped := man & 0x1FFFFF
+	if dropped > 0x100000 || (dropped == 0x100000 && manF&1 == 1) {
+		manF++ // RNE on the dropped low 21 bits
 	}
 	if manF >= 4 {
 		manF = 0
@@ -415,15 +332,24 @@ func int8Scale(maxAbs float32) float32 {
 }
 
 // f32ToInt8 quantizes the f32 quotient f/scale to the nearest int8 in
-// [-127,127] using math.Round (half-away-from-zero). Edge behavior per the
-// file-header convention: NaN -> 0 (handled explicitly - the clamps below
-// are float comparisons that are false for NaN, and int8(NaN) is
-// implementation-defined per the Go spec), +Inf -> 127, -Inf -> -127,
-// scale == 0 -> 0.
+// [-127,127] using round-to-nearest-even (RNE) - the same rounding as
+// torch.round, which (together with int8Scale's scale) makes the int8
+// output bit-identical to the torch reference pipeline
+// (t.abs().max()/127, torch.round(t/scale).clamp(-127,127)) for every
+// finite input. Edge behavior per the file-header convention: NaN -> 0
+// (NaN inputs and NaN quotients are handled explicitly - otherwise the
+// NaN would reach the int conversion, which is implementation-defined
+// per the Go spec), +/-Inf -> +/-127, scale == 0 -> 0.
+//
+// The float is clamped to [-127,127] BEFORE the int conversion: an
+// unclamped |t| > 2^31 would be an out-of-range conversion (undefined in
+// Go). Clamping first is provably equivalent to clamping the rounded
+// result: for |t| > 127 the RNE result is 127 (t in (127,127.5)) or
+// >= 128 in magnitude, and the clamp maps both to +/-127 either way.
 //
 // S4 note: an f32-only rewrite (one f32 divide, magnitude clamps and the
-// sign read from the f32 bits, no float64, no math.Round) was prototyped
-// and is byte-identical to this version (see f32ToInt8Ref and
+// sign read from the f32 bits, no float64) was prototyped and is
+// byte-identical to this version (see f32ToInt8Ref and
 // TestInt8Int4QuantizeOracle), but on this machine it measured ~2.1x
 // slower than the float64 path in the S1 microbenchmark, so the float64
 // implementation is kept.
@@ -434,12 +360,27 @@ func f32ToInt8(f, scale float32) int8 {
 	if scale == 0 {
 		return 0
 	}
-	q := math.Round(float64(f / scale))
-	if q > 127 {
-		q = 127
+	t := float64(f / scale)
+	if math.IsNaN(t) {
+		return 0
 	}
-	if q < -127 {
-		q = -127
+	if t > 127 {
+		t = 127
+	}
+	if t < -127 {
+		t = -127
+	}
+	q := int32(t) // truncate toward zero; |t| <= 127 here
+	frac := t - float64(q)
+	switch {
+	case frac > 0.5:
+		q++
+	case frac == 0.5 && q&1 == 1:
+		q++ // RNE: tie to even (q odd -> up)
+	case frac < -0.5:
+		q--
+	case frac == -0.5 && q&1 == 1:
+		q-- // RNE: tie to even (q odd -> down; oddness is sign-symmetric)
 	}
 	return int8(q)
 }
@@ -462,11 +403,11 @@ func int4Scale(maxAbs float32) float32 {
 // f32ToInt4RNE quantizes the f32 quotient f/scale to the nearest int4 value
 // in [-7,7], using true round-to-nearest-even (RNE), as exact bit
 // manipulation - one f32 divide, the magnitude clamp and the RNE rounding
-// on v's f32 bits, no float64 promotion. It is deliberately distinct from
-// f32ToInt8's half-away-from-zero: a quotient of exactly 2.5 rounds to 2
-// here, not 3. For |v| < 8 the RNE tests reduce to exact integer compares
-// on v's 24-bit significand - the same rounding the pre-S4 float64 version
-// performed, bit for bit.
+// on v's f32 bits, no float64 promotion. It shares f32ToInt8's RNE tie
+// semantics (a quotient of exactly 2.5 rounds to 2, not 3); only the
+// implementation differs. For |v| < 8 the RNE tests reduce to exact
+// integer compares on v's 24-bit significand - the same rounding the
+// pre-S4 float64 version performed, bit for bit.
 //
 // Edge behavior: NaN -> 0, +Inf -> 7, -Inf -> -7, scale == 0 -> 0, and
 // magnitudes >= 7.5 clamp to 7 - clamped in float space before the integer
