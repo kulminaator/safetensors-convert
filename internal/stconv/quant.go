@@ -784,31 +784,6 @@ func streamConvRot(r io.ReaderAt, w io.Writer, offset int64, srcDType DType, sha
 		return int(rows), nil
 	}
 
-	// Zero-element tensors: no data to read, no groups to rotate, and the
-	// row-width check below would divide by zero (a 1-D tensor's row width
-	// is numElems itself). Write exactly the sibling bytes planSiblings
-	// planned - one F32 scale per row, with a 1-D tensor counting as one
-	// row and a 2-D (or wider) tensor shape[0] rows - each
-	// int8Scale(0) = 1.0, the same value an all-zero row would produce.
-	// The output header's data_offsets were planned from this same
-	// formula, so the written bytes must match the planned sibling bytes
-	// exactly, or every tensor after this one in the file shifts by the
-	// difference (silent corruption).
-	if numElems == 0 {
-		rows := int64(1)
-		if len(shape) >= 2 {
-			rows = shape[0]
-		}
-		var scaleBuf [4]byte
-		binary.LittleEndian.PutUint32(scaleBuf[:], math.Float32bits(int8Scale(0)))
-		for i := int64(0); i < rows; i++ {
-			if _, err := w.Write(scaleBuf[:]); err != nil {
-				return 0, err
-			}
-		}
-		return int(rows), nil
-	}
-
 	// c is the row width in elements; the row of element i is i/c. A 1-D
 	// tensor is a single row of the whole tensor.
 	var c int64

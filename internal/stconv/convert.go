@@ -1456,18 +1456,3 @@ func toFloat32Slice(raw []byte, dtype DType) ([]float32, error) {
 	}
 	return toFloat32SliceInto(make([]float32, len(raw)/size), raw, dtype)
 }
-
-// toFloat32Slice decodes raw tensor bytes of the given source dtype into a
-// fresh []float32 for uniform downstream processing. The streaming passes
-// use toFloat32SliceInto with a reused chunk-sized scratch instead; this
-// wrapper remains for one-shot callers (and the tests).
-func toFloat32Slice(raw []byte, dtype DType) ([]float32, error) {
-	size, err := dtype.ByteSize()
-	if err != nil {
-		return nil, err
-	}
-	if size == 0 || len(raw)%size != 0 {
-		return nil, fmt.Errorf("raw byte length %d not a multiple of element size %d", len(raw), size)
-	}
-	return toFloat32SliceInto(make([]float32, len(raw)/size), raw, dtype)
-}
