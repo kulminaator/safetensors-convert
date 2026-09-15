@@ -54,7 +54,7 @@ func run() error {
 	minElems := flag.Int("min-elems", 0, "skip conversion for tensors with fewer elements than this (e.g. to leave small bias/norm vectors alone)")
 	chunkElems := flag.Int("chunk-elems", stconv.DefaultChunkElems, "elements processed per streaming chunk; bounds peak memory regardless of tensor/file size")
 	noProtect := flag.Bool("no-protect", false, "disable the built-in default precision policy and convert every tensor to the target dtype; by default, protected tensors (norm weights, token embeddings, the output head, and attention projections for fp8 targets) are kept at their original precision - see quantization-advice.md")
-	quiet := flag.Bool("quiet", false, "suppress per-tensor report")
+	quiet := flag.Bool("quiet", false, "suppress the per-tensor report and the progress output")
 	flag.Parse()
 
 	if *inPath == "" || *outPath == "" {
@@ -93,6 +93,11 @@ func run() error {
 		Protect:     !*noProtect,
 		MinElems:    *minElems,
 		ChunkElems:  *chunkElems,
+	}
+	// The progress line goes to stderr, so the per-tensor report on
+	// stdout stays pipeable; -quiet turns the line off with the report.
+	if !*quiet {
+		opts.Progress = stconv.NewProgress(os.Stderr)
 	}
 	if outMode == stconv.OutputMulti {
 		opts.OutputDir = outTarget

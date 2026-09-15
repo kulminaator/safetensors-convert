@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"os"
@@ -920,6 +921,105 @@ func TestConvertEmptyTensorsOtherTargets(t *testing.T) {
 	}
 }
 
+// TestConvertModelProgress pins the progress wiring end to end: a run of
+// the 3-tensor single fixture with a Progress on a buffer renders the
+// [i/3] index for every tensor, all three tensor names, and ends with a
+// newline (one final line per tensor). The same run without a reporter
+// (Progress: nil) must produce a byte-identical output file - progress
+// is display-only and never touches the output bytes - and that output
+// must match the committed golden (which the e2e suite also pins; same
+// options: TargetInt8, no policy, so every tensor converts through the
+// two-pass int8 Add path). The passthrough Add path (copyRaw) is covered
+// by TestConvertModelProgressEmptyTensor (the fixture's 16-element
+// tensor skips convrot and copies through).
+func TestConvertModelProgress(t *testing.T) {
+	var buf bytes.Buffer
+	outProg := filepath.Join(t.TempDir(), "out.progress.safetensors")
+	if _, err := ConvertFile(ConvertOptions{
+		InputPath:  singleFixturePath,
+		OutputPath: outProg,
+		Default:    TargetInt8,
+		Progress:   NewProgress(&buf),
+	}); err != nil {
+		t.Fatalf("ConvertFile (progress): %v", err)
+	}
+	text := buf.String()
+	for _, want := range []string{
+		"[1/3]", "[2/3]", "[3/3]",
+		nameUpProj, nameQProj, nameNorm,
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("progress stream missing %q:\n%s", want, text)
+		}
+	}
+	if !strings.HasSuffix(text, "\n") {
+		t.Errorf("progress stream must end with a newline, got %q", text)
+	}
+
+	outPlain := filepath.Join(t.TempDir(), "out.plain.safetensors")
+	if _, err := ConvertFile(ConvertOptions{
+		InputPath:  singleFixturePath,
+		OutputPath: outPlain,
+		Default:    TargetInt8,
+	}); err != nil {
+		t.Fatalf("ConvertFile (no progress): %v", err)
+	}
+	gotProg, err := os.ReadFile(outProg)
+	if err != nil {
+		t.Fatalf("reading progress output: %v", err)
+	}
+	gotPlain, err := os.ReadFile(outPlain)
+	if err != nil {
+		t.Fatalf("reading plain output: %v", err)
+	}
+	if !bytes.Equal(gotProg, gotPlain) {
+		t.Errorf("output with progress differs from output without (%d vs %d bytes)", len(gotProg), len(gotPlain))
+	}
+	want, err := os.ReadFile(filepath.Join(filepath.Dir(singleFixturePath), "golden.int8.safetensors"))
+	if err != nil {
+		t.Fatalf("reading golden: %v", err)
+	}
+	if !bytes.Equal(gotPlain, want) {
+		t.Errorf("output without progress differs from golden (%d vs %d bytes)", len(gotPlain), len(want))
+	}
+}
+
+// TestConvertModelProgressEmptyTensor pins the reporter on the empty
+// fixture: the zero-byte tensors render the "done" form (no percentage,
+// no eta, no divide-by-zero) and the run succeeds.
+func TestConvertModelProgressEmptyTensor(t *testing.T) {
+	var buf bytes.Buffer
+	out := filepath.Join(t.TempDir(), "out.safetensors")
+	if _, err := ConvertFile(ConvertOptions{
+		InputPath:  emptyFixturePath,
+		OutputPath: out,
+		Default:    TargetInt8ConvRot,
+		Protect:    true,
+		Progress:   NewProgress(&buf),
+	}); err != nil {
+		t.Fatalf("ConvertFile: %v", err)
+	}
+	text := buf.String()
+	for _, want := range []string{"[1/4]", "[4/4]"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("progress stream missing %q:\n%s", want, text)
+		}
+	}
+	if !strings.HasSuffix(text, "\n") {
+		t.Errorf("progress stream must end with a newline, got %q", text)
+	}
+	// Every line of the zero-byte tensors must be the "done" form.
+	for _, seg := range strings.Split(text, "\r") {
+		seg = strings.TrimRight(seg, "\n")
+		if !strings.Contains(seg, "empty2d.w") && !strings.Contains(seg, "empty1d.w") {
+			continue
+		}
+		if !strings.HasSuffix(seg, "done") || strings.Contains(seg, "%") || strings.Contains(seg, "eta") {
+			t.Errorf("zero-byte tensor line must render the done form without pct/eta, got %q", seg)
+		}
+	}
+}
+
 // TestConvertTensorWrittenBytesGuard is the unit test for the
 // plan/stream guard in convertTensor: a hand-constructed tensorPlan with
 // an intentionally wrong outLen (fp8 target, outLen = numElems + 1) must
@@ -951,7 +1051,7 @@ func TestConvertTensorWrittenBytesGuard(t *testing.T) {
 		outLen:       9, // deliberately wrong: fp8 of 8 elems writes 8 bytes
 	}
 	buf := &bytes.Buffer{}
-	_, err = convertTensor(p, f, buf, DefaultChunkElems)
+	_, err = convertTensor(p, f, buf, DefaultChunkElems, newPassScratch(DefaultChunkElems), nil)
 	if err == nil {
 		t.Fatal("expected a plan/stream mismatch error, got nil")
 	}
@@ -1086,7 +1186,8 @@ func TestStreamConvertInt8SpecialValues(t *testing.T) {
 
 	// chunkElems=4 forces two chunks, so the special values (indices 1,
 	// 3, 4) straddle the chunk boundary.
-	maxAbs, err := streamComputeMaxAbsScale(src, 0, DTypeF32, int64(len(vals)), 4)
+	sc := newPassScratch(4)
+	maxAbs, err := streamComputeMaxAbsScale(src, 0, DTypeF32, int64(len(vals)), 4, sc, nil)
 	if err != nil {
 		t.Fatalf("streamComputeMaxAbsScale: %v", err)
 	}
@@ -1096,7 +1197,7 @@ func TestStreamConvertInt8SpecialValues(t *testing.T) {
 	scale := int8Scale(maxAbs) // 10/127
 
 	var w bytes.Buffer
-	if err := streamConvertInt8(src, &w, 0, DTypeF32, int64(len(vals)), 4, scale); err != nil {
+	if err := streamConvertInt8(src, &w, 0, DTypeF32, int64(len(vals)), 4, scale, sc, nil); err != nil {
 		t.Fatalf("streamConvertInt8: %v", err)
 	}
 	// Hand-computed at scale = 10/127: 0.5 -> round(6.35) = 6; 10 -> 127;
@@ -1104,6 +1205,309 @@ func TestStreamConvertInt8SpecialValues(t *testing.T) {
 	want := []byte{6, 0, 127, 127, 129, 231}
 	if !bytes.Equal(w.Bytes(), want) {
 		t.Errorf("int8 bytes = %v, want %v (NaN -> 0, +Inf -> 127, -Inf -> 129)", w.Bytes(), want)
+	}
+}
+
+// TestParallelPassesMatchSerial pins the fan-out partitioning of the four
+// parallel passes (max-abs scan, fp8, int8, int4) itself, independent of
+// the goldens' small fixtures: for each pass, the stream function's output
+// over a ~3M-element synthetic F16 tensor (seeded rand, one element at the
+// known max magnitude 100.0) must match the reference computed by the
+// serial algorithm copied from the pre-parallelization code (for the scan:
+// the serial max, which must be the known 100.0). The chunk size (1000) is
+// far below the tensor, so the chunk loop and its fan-out run over 3000+
+// chunks, and the odd 501-element final chunk exercises the int4
+// tensor-level pad nibble in the last worker's range.
+func TestParallelPassesMatchSerial(t *testing.T) {
+	const (
+		n     = 3_000_501
+		chunk = 1000
+	)
+
+	// Synthetic values: seeded rand in (-99, 99) plus one element at the
+	// known max magnitude 100.0 (exact in f16; the rand values stay below
+	// it even after f16 rounding, so the max is exactly 100.0).
+	rng := rand.New(rand.NewSource(7))
+	vals := make([]float32, n)
+	for i := range vals {
+		vals[i] = float32(rng.Float64()*2-1) * 99
+	}
+	vals[n/2] = 100.0
+
+	// F16 source bytes, and the exact f32 values the passes decode - the
+	// serial references below run over these.
+	raw := make([]byte, 2*n)
+	for i, v := range vals {
+		binary.LittleEndian.PutUint16(raw[2*i:], f32ToF16(v))
+	}
+	floats, err := toFloat32Slice(raw, DTypeF16)
+	if err != nil {
+		t.Fatalf("toFloat32Slice: %v", err)
+	}
+	src := bytes.NewReader(raw)
+	// The per-test pass scratch (the tests keep allocating their own -
+	// see passScratch).
+	sc := newPassScratch(chunk)
+
+	// serialMaxAbs is the pre-parallelization serial scan, copied.
+	serialMaxAbs := func() float32 {
+		var m float32
+		for _, f := range floats {
+			if math.IsNaN(float64(f)) || math.IsInf(float64(f), 0) {
+				continue
+			}
+			a := f
+			if a < 0 {
+				a = -a
+			}
+			if a > m {
+				m = a
+			}
+		}
+		return m
+	}
+
+	t.Run("scan", func(t *testing.T) {
+		got, err := streamComputeMaxAbsScale(src, 0, DTypeF16, n, chunk, sc, nil)
+		if err != nil {
+			t.Fatalf("streamComputeMaxAbsScale: %v", err)
+		}
+		want := serialMaxAbs()
+		if got != want {
+			t.Errorf("maxAbs = %v, want %v (the serial scan over the same values)", got, want)
+		}
+		if want != 100.0 {
+			t.Errorf("fixture max = %v, want 100 (the known max)", want)
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		e4m3 bool
+	}{
+		{"fp8_e4m3", true},
+		{"fp8_e5m2", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var w bytes.Buffer
+			if err := streamConvertFP8(src, &w, 0, DTypeF16, n, chunk, tc.e4m3, sc, nil); err != nil {
+				t.Fatalf("streamConvertFP8: %v", err)
+			}
+			want := make([]byte, n)
+			for i, f := range floats {
+				if tc.e4m3 {
+					want[i] = f32ToF8E4M3(f)
+				} else {
+					want[i] = f32ToF8E5M2(f)
+				}
+			}
+			if !bytes.Equal(w.Bytes(), want) {
+				t.Errorf("fp8 bytes differ from the serial reference (%d bytes)", n)
+			}
+		})
+	}
+
+	t.Run("int8", func(t *testing.T) {
+		scale := int8Scale(serialMaxAbs())
+		var w bytes.Buffer
+		if err := streamConvertInt8(src, &w, 0, DTypeF16, n, chunk, scale, sc, nil); err != nil {
+			t.Fatalf("streamConvertInt8: %v", err)
+		}
+		want := make([]byte, n)
+		for i, f := range floats {
+			want[i] = byte(f32ToInt8(f, scale))
+		}
+		if !bytes.Equal(w.Bytes(), want) {
+			t.Errorf("int8 bytes differ from the serial reference (%d bytes)", n)
+		}
+	})
+
+	t.Run("int4", func(t *testing.T) {
+		scale := int4Scale(serialMaxAbs())
+		var w bytes.Buffer
+		if err := streamInt4Data(src, &w, 0, DTypeF16, n, scale, chunk, sc, nil); err != nil {
+			t.Fatalf("streamInt4Data: %v", err)
+		}
+		nibs := make([]uint8, n)
+		for i, f := range floats {
+			nibs[i] = uint8(f32ToInt4RNE(f, scale) & 0x0F)
+		}
+		want := packNibbles(nibs)
+		if !bytes.Equal(w.Bytes(), want) {
+			t.Errorf("int4 packed bytes differ from the serial reference (%d bytes)", len(want))
+		}
+	})
+}
+
+// offsetReaderAt wraps an io.ReaderAt, recording each ReadAt's offset and
+// the running total of bytes read, in call order. It is the countingReaderAt
+// style from quant_test.go extended to keep the offset sequence, so a test
+// can assert the reads cover the tensor exactly and never go backward.
+type offsetReaderAt struct {
+	r     io.ReaderAt
+	offs  []int64
+	total int64
+}
+
+func (o *offsetReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	n, err := o.r.ReadAt(p, off)
+	o.offs = append(o.offs, off)
+	o.total += int64(n)
+	return n, err
+}
+
+// TestPrefetchReadsAllBytesInOrder pins the double-buffered chunk loop of
+// the per-element passes (exercised here through streamConvertFP8): the
+// first chunk is read synchronously and each later chunk is prefetched
+// into a second buffer while the previous chunk is computed. The prefetch
+// changes only timing, never the bytes, so the test asserts (a) the total
+// bytes read equal the tensor's byte length (every byte read exactly once -
+// no re-reads from a wrong buffer swap and no gaps), (b) the read offsets
+// are in non-decreasing order (the prefetch reads strictly forward), and
+// (c) the output is byte-identical to the serial path's output. A buggy
+// prefetch (wrong offset, a re-read, a skipped chunk, or a bad swap) breaks
+// one of these. The tensor is far larger than the chunk, so the prefetch
+// engages across many chunk boundaries.
+func TestPrefetchReadsAllBytesInOrder(t *testing.T) {
+	const (
+		n     = 100_003 // odd, not a multiple of the chunk
+		chunk = 4096
+	)
+	rng := rand.New(rand.NewSource(99))
+	vals := make([]float32, n)
+	for i := range vals {
+		vals[i] = float32(rng.Float64()*2-1) * 3
+	}
+	vals[n/2] = 42.0
+
+	// F16 source bytes and the exact f32 values the pass decodes - the
+	// serial reference below runs over these.
+	raw := make([]byte, 2*n)
+	for i, v := range vals {
+		binary.LittleEndian.PutUint16(raw[2*i:], f32ToF16(v))
+	}
+	floats, err := toFloat32Slice(raw, DTypeF16)
+	if err != nil {
+		t.Fatalf("toFloat32Slice: %v", err)
+	}
+
+	// Serial reference output (the serial path's output).
+	want := make([]byte, n)
+	for i, f := range floats {
+		want[i] = f32ToF8E4M3(f)
+	}
+
+	// Run the (prefetching) pass over the counting reader.
+	or := &offsetReaderAt{r: bytes.NewReader(raw)}
+	var w bytes.Buffer
+	if err := streamConvertFP8(or, &w, 0, DTypeF16, n, chunk, true, newPassScratch(chunk), nil); err != nil {
+		t.Fatalf("streamConvertFP8: %v", err)
+	}
+
+	// (a) Every byte of the tensor read exactly once.
+	if or.total != int64(len(raw)) {
+		t.Fatalf("total bytes read = %d, want %d (the tensor's byte length)", or.total, len(raw))
+	}
+
+	// (b) Read offsets in non-decreasing order.
+	for i := 1; i < len(or.offs); i++ {
+		if or.offs[i] < or.offs[i-1] {
+			t.Fatalf("read %d at offset %d is before read %d at offset %d (reads must not go backward)",
+				i, or.offs[i], i-1, or.offs[i-1])
+		}
+	}
+
+	// (c) Output identical to the serial path's output.
+	if !bytes.Equal(w.Bytes(), want) {
+		t.Errorf("fp8 bytes differ from the serial reference (%d bytes)", n)
+	}
+}
+
+// TestPassScratchBounds pins the per-run pass scratch's memory bound
+// (see passScratch): the total byte size is the documented formula
+// f(chunkElems) - O(chunk) x a small constant, independent of tensor or
+// file size - and the constructor allocates exactly that. The table
+// covers the rounding boundaries (below one convrot window, exactly one
+// window, an odd multi-window value, and the default) so the max-window
+// rounding stays pinned. End-to-end, the scratch is exercised at three
+// small chunk sizes on the single fixture: the output must be
+// byte-identical to the default chunk's (the scratch is sized to
+// chunkElems, so every size exercises a different allocation). The RSS
+// decoupling on real models is S14's job.
+func TestPassScratchBounds(t *testing.T) {
+	// The documented formula (see passScratchSize), written
+	// independently here: w is the convrot window rounding, the largest
+	// of all passes' chunk roundings.
+	wantSize := func(chunkElems int) int64 {
+		w := int64((chunkElems + convrotGroup - 1) / convrotGroup * convrotGroup)
+		return 2*w*8 + // raw1 + raw2 (max element size, F64)
+			w*4 + // fbuf (f32 decode)
+			w + // out (fp8/int8, 1 byte/elem)
+			(w+1)/2 + // packedInt4 (2 elems/byte)
+			w/32 + (w+1)/2 + // mxfp4 scales + packed
+			int64(max(1, parallelism(int(w/32))))*32 + // mxfp4 per-worker quantize scratch
+			w/16 + (w+1)/2 + // nvfp4 scales + packed
+			int64(max(1, parallelism(int(w/16))))*16 + // nvfp4 per-worker quantize scratch
+			w*4 + // convrot groups (one f32/elem)
+			int64(max(1, parallelism(int(w))))*4 // scan per-worker max
+	}
+	for _, chunk := range []int{1, 255, 256, 1000, 1 << 20} {
+		// (a) The size function is the documented formula.
+		if got, want := passScratchSize(chunk), wantSize(chunk); got != want {
+			t.Errorf("passScratchSize(%d) = %d, want %d (the documented formula)", chunk, got, want)
+		}
+		// (b) The constructor allocates exactly the documented total.
+		sc := newPassScratch(chunk)
+		var actual int64
+		actual += int64(cap(sc.raw1)) + int64(cap(sc.raw2))
+		actual += int64(cap(sc.fbuf)) * 4
+		actual += int64(cap(sc.out))
+		actual += int64(cap(sc.packedInt4))
+		actual += int64(cap(sc.mxfp4Scales)) + int64(cap(sc.mxfp4Packed))
+		for _, q := range sc.mxfp4Qs {
+			actual += int64(cap(q))
+		}
+		actual += int64(cap(sc.nvfp4Scales)) + int64(cap(sc.nvfp4Packed))
+		for _, q := range sc.nvfp4Qs {
+			actual += int64(cap(q))
+		}
+		actual += int64(len(sc.convrotGroups)) * convrotGroup * 4
+		actual += int64(cap(sc.results)) * 4
+		if actual != wantSize(chunk) {
+			t.Errorf("newPassScratch(%d) allocates %d bytes, want %d (the documented formula)", chunk, actual, wantSize(chunk))
+		}
+	}
+
+	// (c) End-to-end at three small chunk sizes, byte-identical to the
+	// default chunk's output for every target.
+	for _, target := range []TargetKind{
+		TargetFP8E4M3, TargetInt8, TargetInt8ConvRot,
+		TargetMxFP4, TargetNVFP4, TargetInt4,
+	} {
+		run := func(chunkElems int) []byte {
+			t.Helper()
+			out := filepath.Join(t.TempDir(), "out.safetensors")
+			if _, err := ConvertFile(ConvertOptions{
+				InputPath:  singleFixturePath,
+				OutputPath: out,
+				Default:    target,
+				Protect:    false, // convert every tensor, not just one
+				ChunkElems: chunkElems,
+			}); err != nil {
+				t.Fatalf("ConvertFile (%v, chunk %d): %v", target, chunkElems, err)
+			}
+			b, err := os.ReadFile(out)
+			if err != nil {
+				t.Fatalf("reading output: %v", err)
+			}
+			return b
+		}
+		base := run(0) // default chunk
+		for _, chunk := range []int{1, 1000, 4096} {
+			if got := run(chunk); !bytes.Equal(got, base) {
+				t.Errorf("target %v: chunk %d output differs from the default chunk output", target, chunk)
+			}
+		}
 	}
 }
 

@@ -144,6 +144,217 @@ func TestHadamard256Determinism(t *testing.T) {
 	}
 }
 
+// hadamard256Ref is a verbatim copy of the pre-S5 hadamard256 (the
+// 8-stage butterfly followed by a separate /16 pass) - the oracle for
+// the byte-identity of the folded final stage.
+func hadamard256Ref(buf []float32) {
+	for s := 1; s < convrotGroup; s <<= 1 {
+		for i := 0; i < convrotGroup; i += 2 * s {
+			for j := 0; j < s; j++ {
+				a, b := buf[i+j], buf[i+j+s]
+				buf[i+j], buf[i+j+s] = a+b, a-b
+			}
+		}
+	}
+	for i := range buf {
+		buf[i] /= 16
+	}
+}
+
+// hadamard256RandomGroups builds 100 seeded random groups in [-1,1].
+func hadamard256RandomGroups() [][]float32 {
+	groups := make([][]float32, 0, 100)
+	rnd := rand.New(rand.NewSource(2025))
+	for g := 0; g < 100; g++ {
+		x := make([]float32, convrotGroup)
+		for i := range x {
+			x[i] = float32(rnd.Float64()*2 - 1)
+		}
+		groups = append(groups, x)
+	}
+	return groups
+}
+
+// hadamard256EdgeGroups builds the three edge groups: all-zero, all-1,
+// and a ±Inf/NaN mix. For the all-zero and all-1 groups the butterfly
+// and the naive row-dot-product reference come out bit-identical in
+// Go, and the tests assert full bit-equality on them. For the mix
+// group, every row of H_256 carries both a +Inf and a -Inf term, so
+// every output is NaN under either summation order; the NaN sign bits
+// themselves are codegen-dependent (the Go compiler constant-folds
+// NaN-propagating operations into a constant NaN whose sign differs
+// between normal and -race builds of the same code), so the tests
+// compare the mix group's NaN outputs by class, not by bits.
+func hadamard256EdgeGroups() [][]float32 {
+	allOnes := make([]float32, convrotGroup)
+	for i := range allOnes {
+		allOnes[i] = 1
+	}
+	mix := make([]float32, convrotGroup) // ±Inf/NaN mix
+	for i := range mix {
+		switch i % 4 {
+		case 0:
+			mix[i] = float32(math.Inf(1))
+		case 1:
+			mix[i] = float32(math.Inf(-1))
+		case 2:
+			mix[i] = float32(math.NaN())
+		default:
+			mix[i] = -1
+		}
+	}
+	return [][]float32{make([]float32, convrotGroup), allOnes, mix}
+}
+
+// sylvesterH256 builds the 256x256 Sylvester Hadamard in flat row-major
+// order ([]float32 of length 65536): H_1 = [1], H_{2n} =
+// [[H_n, H_n], [H_n, -H_n]] - the same construction hadamard256's
+// butterfly implements, but as an explicit matrix, so the two are
+// independent implementations of the same transform.
+func sylvesterH256() []float32 {
+	h := make([]float32, 256*256)
+	h[0] = 1
+	for n := 1; n < 256; n <<= 1 {
+		// Snapshot the current n x n block first: the quadrant writes
+		// below overlap the old layout (the new top-right quadrant lands
+		// on the old lower rows), so the reads must come from a copy.
+		old := make([]float32, n*n)
+		copy(old, h[:n*n])
+		for i := 0; i < n; i++ {
+			for j := 0; j < n; j++ {
+				v := old[i*n+j]
+				h[i*2*n+j] = v
+				h[i*2*n+n+j] = v
+				h[(i+n)*2*n+j] = v
+				h[(i+n)*2*n+n+j] = -v
+			}
+		}
+	}
+	return h
+}
+
+// hadamard256Naive computes y = H_256·x/16 as a plain matrix-vector
+// product: for each row, an f32 dot product accumulated left to right
+// (the ±1 matrix entries make each product exactly ±x[j]), with the /16
+// normalization applied at the end. It is the independent reference for
+// the butterfly in TestHadamard256NaiveMatrixReference.
+func hadamard256Naive(h, x []float32) []float32 {
+	y := make([]float32, convrotGroup)
+	for i := 0; i < convrotGroup; i++ {
+		var s float32
+		for j := 0; j < convrotGroup; j++ {
+			s += h[i*convrotGroup+j] * x[j]
+		}
+		y[i] = s / 16
+	}
+	return y
+}
+
+// TestHadamard256MatchesReference asserts the folded-final-stage
+// hadamard256 is bit-identical to the pre-S5 implementation (butterfly
+// plus a separate /16 pass) - the byte-identity proof for the fold: for
+// every f32, x*0.0625 and x/16 are the same correctly rounded exact
+// rescale by 2^-4, so the final stage's output is unchanged. Besides the
+// standard 100 random + 3 edge groups, it adds 10 magnitude-spread
+// groups (random values scaled across 2^-150 to 2^100) so the final
+// stage's inputs span subnormals through near-overflow magnitudes.
+// NaN outputs (only the ±Inf/NaN mix edge group produces any) are
+// compared by class rather than by bits: the NaN sign is
+// codegen-dependent (normal and -race builds of the same code can
+// differ), and NaN inputs are outside the tool's supported domain
+// (real weights are finite), so the class is the assertable contract.
+func TestHadamard256MatchesReference(t *testing.T) {
+	groups := append(hadamard256RandomGroups(), hadamard256EdgeGroups()...)
+	rnd := rand.New(rand.NewSource(2026))
+	for g := 0; g < 10; g++ {
+		x := make([]float32, convrotGroup)
+		for i := range x {
+			x[i] = float32(rnd.Float64()*2-1) * float32(math.Ldexp(1, int(rnd.Intn(251))-150))
+		}
+		groups = append(groups, x)
+	}
+	for gi, x := range groups {
+		got := append([]float32(nil), x...)
+		want := append([]float32(nil), x...)
+		hadamard256(got)
+		hadamard256Ref(want)
+		for i := range got {
+			g, w := got[i], want[i]
+			if g == w || (g != g && w != w) { // NaN outputs: class only, see above
+				continue
+			}
+			t.Fatalf("group %d, elem %d: hadamard256 = %v (bits %08X), pre-S5 reference = %v (bits %08X)",
+				gi, i, g, math.Float32bits(g), w, math.Float32bits(w))
+		}
+	}
+}
+
+// TestHadamard256NaiveMatrixReference checks hadamard256 against an
+// independent reference: the explicit Sylvester H_256 applied as a plain
+// f32 row dot product with the /16 normalization at the end, over 100
+// seeded random groups in [-1,1] and the three edge groups. The
+// butterfly and the dot product sum the 256 ±x terms in different
+// orders, and f32 addition is not associative, so the plan's
+// bit-equality assertion is not valid for the random groups (the first
+// run caught a 1-ULP difference in group 0 against the correct matrix);
+// their finite outputs are instead asserted within the standard f32
+// summation error bound |got-want| <= 2·γ·Σ|x|/16 + 2·u·|want| (u =
+// 2^-24, γ = 255·u/(1-255·u)) - the maximum legitimate difference the
+// two summation orders can introduce - with ±Inf outputs bit-equal and
+// any NaN/Inf class mismatch a failure. The edge groups are asserted
+// fully bit-equal except the mix group's NaN outputs, which are
+// compared by class (the NaN sign bits are codegen-dependent, see
+// hadamard256EdgeGroups).
+func TestHadamard256NaiveMatrixReference(t *testing.T) {
+	h := sylvesterH256()
+	const u = 1.0 / 16777216 // f32 unit roundoff, 2^-24
+	const gamma = 255 * u / (1 - 255*u)
+	for gi, x := range hadamard256RandomGroups() {
+		want := hadamard256Naive(h, x)
+		got := append([]float32(nil), x...)
+		hadamard256(got)
+		var sumAbs float64
+		for _, v := range x {
+			sumAbs += math.Abs(float64(v))
+		}
+		bound := 2 * gamma * sumAbs / 16
+		for i := range got {
+			g, w := got[i], want[i]
+			switch {
+			case g == w:
+			case g != g && w != w:
+				if math.Signbit(float64(g)) != math.Signbit(float64(w)) {
+					t.Fatalf("group %d, elem %d: NaN sign mismatch: got %08X, want %08X",
+						gi, i, math.Float32bits(g), math.Float32bits(w))
+				}
+			case g != g || w != w:
+				t.Fatalf("group %d, elem %d: NaN mismatch: got %v, want %v", gi, i, g, w)
+			case math.IsInf(float64(g), 0) || math.IsInf(float64(w), 0):
+				t.Fatalf("group %d, elem %d: Inf mismatch: got %v, want %v", gi, i, g, w)
+			default:
+				d := math.Abs(float64(g) - float64(w))
+				if d > bound+2*u*math.Abs(float64(w)) {
+					t.Fatalf("group %d, elem %d: hadamard256 = %v, naive reference = %v, |diff| = %v > bound %v",
+						gi, i, g, w, d, bound+2*u*math.Abs(float64(w)))
+				}
+			}
+		}
+	}
+	for gi, x := range hadamard256EdgeGroups() {
+		want := hadamard256Naive(h, x)
+		got := append([]float32(nil), x...)
+		hadamard256(got)
+		for i := range got {
+			g, w := got[i], want[i]
+			if g == w || (g != g && w != w) { // NaN outputs: class only, see above
+				continue
+			}
+			t.Fatalf("edge group %d, elem %d: hadamard256 = %v (bits %08X), naive reference = %v (bits %08X)",
+				gi, i, g, math.Float32bits(g), w, math.Float32bits(w))
+		}
+	}
+}
+
 // TestConvertConvRotSingle256 is the end-to-end check on the committed
 // testdata/single256 fixture (BF16 [2,128]: row 0 = 0.01 with an 85.0
 // outlier at index 64, row 1 = 0.05*(i%7-3)). It verifies the P2 S3
@@ -388,6 +599,20 @@ func (c *countingReaderAt) ReadAt(p []byte, off int64) (int, error) {
 	return n, err
 }
 
+// writeCallCounter accumulates the written bytes and counts the Write
+// calls (to pin per-chunk write batching in the streaming passes). It is
+// distinct from convert.go's countingWriter, which counts only bytes.
+type writeCallCounter struct {
+	buf   bytes.Buffer
+	calls int
+}
+
+func (c *writeCallCounter) Write(p []byte) (int, error) {
+	n, err := c.buf.Write(p)
+	c.calls++
+	return n, err
+}
+
 // runConvRot runs streamConvRot over vals (presented as an F32 source
 // with the given shape) and returns the written bytes (the row scales,
 // then the rotated I8 data) and the counting reader.
@@ -395,7 +620,9 @@ func runConvRot(t *testing.T, vals []float32, shape []int64, chunkElems int) ([]
 	t.Helper()
 	cr := &countingReaderAt{r: bytes.NewReader(f32ToBytes(vals))}
 	var w bytes.Buffer
-	if _, err := streamConvRot(cr, &w, 0, DTypeF32, shape, int64(len(vals)), chunkElems); err != nil {
+	// The per-test pass scratch (the tests keep allocating their own -
+	// see passScratch).
+	if _, err := streamConvRot(cr, &w, 0, DTypeF32, shape, int64(len(vals)), chunkElems, newPassScratch(chunkElems), nil); err != nil {
 		t.Fatalf("streamConvRot: %v", err)
 	}
 	return w.Bytes(), cr
@@ -503,6 +730,104 @@ func TestStreamConvRotWindowedReads(t *testing.T) {
 	}
 }
 
+// TestConvRotParallelRotate runs streamConvRot's parallel window
+// rotation over a seeded 4096-element (16-group) tensor and requires the
+// output to be byte-identical to the reference (per-group Hadamard,
+// per-row scale = rowMax/127 over the rotated values, f32ToInt8 - the
+// existing reference style). The subtests cover the window cases the
+// parallel rotation must not change:
+//
+//   - rows128 + 1-group window: 16 windows per sweep; the row width 128
+//     (not a multiple of 256) puts two rows in each group, so pass 1
+//     tracks rows per element and each row reads only half its group;
+//     the second row of a pair rescans and quantizes from the first
+//     row's rotated window with no re-read.
+//   - rows128 + 2-group window: each window's two groups are rotated by
+//     separate workers (the mapStrided fan-out, k > 1).
+//   - rows512 + 1-group window: each row spans two groups in two
+//     windows - the rescan rotates the union of the touched windows and
+//     the quantize re-reads and re-rotates them.
+//   - rows512 + 2-group window: each row spans exactly one window; the
+//     quantize reads the rescan's rotated buffers directly, with no
+//     re-read and no re-rotation.
+//   - 1-D + whole-tensor window: all 16 groups rotated at once by up to
+//     NumCPU workers.
+//
+// (A row width that is both a non-multiple of 256 and wide enough to
+// span two windows is impossible at 4096 = 2^12 elements - every valid
+// row width is a power of two, the sub-256 ones divide 256 and never
+// straddle a group boundary - so the two properties are pinned by
+// separate shapes.)
+func TestConvRotParallelRotate(t *testing.T) {
+	rnd := rand.New(rand.NewSource(2027))
+	const groups = 16 // 4096 elements
+	vals := make([]float32, groups*convrotGroup)
+	for i := range vals {
+		vals[i] = float32(rnd.Float64()*2 - 1)
+	}
+	vals[3000] = 33.0 // outlier so row scales are non-trivial
+
+	// Reference: rotate every group in place, then per row take the max
+	// |v| over the rotated values (scale = rowMax/127) and quantize.
+	ref := func(shape []int64) []byte {
+		var c int64
+		if len(shape) >= 2 {
+			c = 1
+			for _, d := range shape[1:] {
+				c *= d
+			}
+		} else {
+			c = int64(len(vals)) // a 1-D tensor is one row
+		}
+		rows := int64(len(vals)) / c
+		rot := append([]float32(nil), vals...)
+		for g := 0; g < groups; g++ {
+			hadamard256(rot[g*convrotGroup : (g+1)*convrotGroup])
+		}
+		want := make([]byte, 4*int(rows)+len(vals))
+		for rr := int64(0); rr < rows; rr++ {
+			var m float32
+			for j := rr * c; j < (rr+1)*c; j++ {
+				v := rot[j]
+				if v < 0 {
+					v = -v
+				}
+				if v > m {
+					m = v
+				}
+			}
+			scale := int8Scale(m)
+			binary.LittleEndian.PutUint32(want[rr*4:], math.Float32bits(scale))
+			for j := rr * c; j < (rr+1)*c; j++ {
+				want[4*rows+j] = byte(f32ToInt8(rot[j], scale))
+			}
+		}
+		return want
+	}
+
+	for _, tc := range []struct {
+		name       string
+		shape      []int64
+		chunkElems int
+	}{
+		{"rows128 window=1group", []int64{32, 128}, 256},
+		{"rows128 window=2groups", []int64{32, 128}, 512},
+		{"rows512 window=1group", []int64{8, 512}, 256},
+		{"rows512 window=2groups", []int64{8, 512}, 512},
+		{"1d window=whole", []int64{4096}, 1 << 20},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, cr := runConvRot(t, vals, tc.shape, tc.chunkElems)
+			if want := ref(tc.shape); !bytes.Equal(out, want) {
+				t.Fatalf("output differs from reference (%d vs %d bytes)", len(out), len(want))
+			}
+			if max := cr.maxEnd; max > int64(len(vals))*4 {
+				t.Errorf("read reached byte %d, past the tensor end %d", max, int64(len(vals))*4)
+			}
+		})
+	}
+}
+
 // f32ToBytes encodes vals as little-endian F32 bytes (a test-side source
 // tensor payload).
 func f32ToBytes(vals []float32) []byte {
@@ -521,7 +846,9 @@ func runMxFP4(t *testing.T, vals []float32, chunkElems int) []byte {
 	t.Helper()
 	src := bytes.NewReader(f32ToBytes(vals))
 	var w bytes.Buffer
-	if err := streamMxFP4(src, &w, 0, DTypeF32, int64(len(vals)), chunkElems); err != nil {
+	// The per-test pass scratch (the tests keep allocating their own -
+	// see passScratch).
+	if err := streamMxFP4(src, &w, 0, DTypeF32, int64(len(vals)), chunkElems, newPassScratch(chunkElems), nil); err != nil {
 		t.Fatalf("streamMxFP4: %v", err)
 	}
 	return w.Bytes()
@@ -535,7 +862,9 @@ func runNVFP4(t *testing.T, vals []float32, chunkElems int) ([]byte, float32) {
 	t.Helper()
 	src := bytes.NewReader(f32ToBytes(vals))
 	var w bytes.Buffer
-	alpha, err := streamNVFP4(src, &w, 0, DTypeF32, int64(len(vals)), chunkElems)
+	// The per-test pass scratch (the tests keep allocating their own -
+	// see passScratch).
+	alpha, err := streamNVFP4(src, &w, 0, DTypeF32, int64(len(vals)), chunkElems, newPassScratch(chunkElems), nil)
 	if err != nil {
 		t.Fatalf("streamNVFP4: %v", err)
 	}
@@ -932,5 +1261,196 @@ func TestConvertMxFP4E2E(t *testing.T) {
 	}
 	if bad > 40 {
 		t.Errorf("... and %d more violations", bad-40)
+	}
+}
+
+// refBlockMax is the max |v| over vals, ignoring NaN/Inf (the same
+// convention as the max-abs scan: those are clamped at quantize time).
+func refBlockMax(vals []float32) float32 {
+	var m float32
+	for _, v := range vals {
+		if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
+			continue
+		}
+		if v < 0 {
+			v = -v
+		}
+		if v > m {
+			m = v
+		}
+	}
+	return m
+}
+
+// refMxFP4Serial is the serial (pre-parallelization) MXFP4 algorithm:
+// all 32-element block scale bytes first (e8m0Encode of the block max,
+// the ".block_scale" sibling), then the packed E2M1 data (two elements
+// per byte, an odd final block zero-padded), each block's scale
+// recomputed on the data pass. TestMxFP4NVFP4ParallelMatchSerial pins
+// the parallel streamMxFP4 against it.
+func refMxFP4Serial(vals []float32) []byte {
+	out := make([]byte, 0, (len(vals)+mxfp4Block-1)/mxfp4Block+(len(vals)+1)/2)
+	for i := 0; i < len(vals); i += mxfp4Block {
+		cnt := mxfp4Block
+		if len(vals)-i < cnt {
+			cnt = len(vals) - i
+		}
+		out = append(out, e8m0Encode(refBlockMax(vals[i:i+cnt])))
+	}
+	for i := 0; i < len(vals); i += mxfp4Block {
+		cnt := mxfp4Block
+		if len(vals)-i < cnt {
+			cnt = len(vals) - i
+		}
+		blk := vals[i : i+cnt]
+		s := e8m0Scale(e8m0Encode(refBlockMax(blk)))
+		qv := make([]uint8, cnt)
+		for j, v := range blk {
+			if s != 0 {
+				qv[j] = f32ToE2M1(v / s)
+			}
+		}
+		out = append(out, packNibbles(qv)...)
+	}
+	return out
+}
+
+// refNVFP4Serial is the serial (pre-parallelization) NVFP4 algorithm:
+// the 4-byte LE F32 global scale alpha = M/(6*448), then all
+// 16-element block scale bytes (f32ToE4M3RNE of blockMax/(6*alpha), 0
+// when alpha == 0; the ".block_scale" sibling), then the packed E2M1
+// data at the step alpha*s, each block's scale recomputed on the data
+// pass. TestMxFP4NVFP4ParallelMatchSerial pins the parallel streamNVFP4
+// against it.
+func refNVFP4Serial(vals []float32) []byte {
+	var M float32
+	for _, v := range vals {
+		if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
+			continue
+		}
+		if v < 0 {
+			v = -v
+		}
+		if v > M {
+			M = v
+		}
+	}
+	var alpha float32
+	if M != 0 {
+		alpha = M / (6 * 448)
+	}
+	out := make([]byte, 0, 4+(len(vals)+nvfp4Block-1)/nvfp4Block+(len(vals)+1)/2)
+	var gs [4]byte
+	binary.LittleEndian.PutUint32(gs[:], math.Float32bits(alpha))
+	out = append(out, gs[:]...)
+	for i := 0; i < len(vals); i += nvfp4Block {
+		cnt := nvfp4Block
+		if len(vals)-i < cnt {
+			cnt = len(vals) - i
+		}
+		blk := vals[i : i+cnt]
+		var code uint8
+		if alpha != 0 {
+			code = f32ToE4M3RNE(refBlockMax(blk) / (6 * alpha))
+		}
+		out = append(out, code)
+	}
+	for i := 0; i < len(vals); i += nvfp4Block {
+		cnt := nvfp4Block
+		if len(vals)-i < cnt {
+			cnt = len(vals) - i
+		}
+		blk := vals[i : i+cnt]
+		var code uint8
+		if alpha != 0 {
+			code = f32ToE4M3RNE(refBlockMax(blk) / (6 * alpha))
+		}
+		step := alpha * f8E4M3ToF32(code)
+		qv := make([]uint8, cnt)
+		for j, v := range blk {
+			if step != 0 {
+				qv[j] = f32ToE2M1(v / step)
+			}
+		}
+		out = append(out, packNibbles(qv)...)
+	}
+	return out
+}
+
+// TestMxFP4NVFP4ParallelMatchSerial pins the parallel mxfp4/nvfp4 block
+// passes against the serial algorithm: seeded random tensors - 1,000,000
+// elements (a multiple of both block sizes: full blocks only) and
+// 1,000,033 (not a multiple of 32 or 16: the final block is a single
+// element, odd, so the packed output carries a pad nibble) - run through
+// both targets with chunkElems = 1000 (mxfp4 rounds it up to 1024 = 32
+// blocks, nvfp4 to 1008 = 63 blocks: each chunk fans out over 16 workers
+// and the final chunk is partial). The parallel output bytes must equal
+// the serial reference (per-block scale, quantize, pack) byte for byte,
+// and the Write count must be one per chunk per pass (plus the single
+// nvfp4 global-scale write) instead of one per block.
+func TestMxFP4NVFP4ParallelMatchSerial(t *testing.T) {
+	rnd := rand.New(rand.NewSource(424242))
+	mkVals := func(n int) []float32 {
+		vals := make([]float32, n)
+		for i := range vals {
+			vals[i] = float32(rnd.Float64()*2 - 1)
+		}
+		vals[1000] = 100.0 // outlier: non-trivial block scales and global max
+		return vals
+	}
+	const chunk = 1000
+	checkBytes := func(label string, got, want []byte) {
+		t.Helper()
+		if len(got) != len(want) {
+			t.Errorf("%s: %d bytes, want %d", label, len(got), len(want))
+			return
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				t.Errorf("%s: byte %d = 0x%02x, want 0x%02x", label, i, got[i], want[i])
+				return
+			}
+		}
+	}
+
+	for _, tc := range []struct {
+		name string
+		vals []float32
+	}{
+		{"1M", mkVals(1_000_000)},
+		{"partial", mkVals(1_000_033)},
+	} {
+		n := int64(len(tc.vals))
+
+		t.Run("mxfp4/"+tc.name, func(t *testing.T) {
+			cw := &writeCallCounter{}
+			if err := streamMxFP4(bytes.NewReader(f32ToBytes(tc.vals)), cw, 0, DTypeF32, n, chunk, newPassScratch(chunk), nil); err != nil {
+				t.Fatalf("streamMxFP4: %v", err)
+			}
+			checkBytes("mxfp4 output", cw.buf.Bytes(), refMxFP4Serial(tc.vals))
+			// One write per chunk per pass (2 passes): 2*ceil(n/1024),
+			// where 1024 is 1000 rounded up to a whole number of 32-
+			// element blocks. The pre-S9 code wrote once per block
+			// (2*ceil(n/32)).
+			if want := 2 * int((n+1023)/1024); cw.calls != want {
+				t.Errorf("mxfp4 writes = %d, want %d (one per chunk per pass)", cw.calls, want)
+			}
+		})
+
+		t.Run("nvfp4/"+tc.name, func(t *testing.T) {
+			cw := &writeCallCounter{}
+			if _, err := streamNVFP4(bytes.NewReader(f32ToBytes(tc.vals)), cw, 0, DTypeF32, n, chunk, newPassScratch(chunk), nil); err != nil {
+				t.Fatalf("streamNVFP4: %v", err)
+			}
+			checkBytes("nvfp4 output", cw.buf.Bytes(), refNVFP4Serial(tc.vals))
+			// One write per chunk for the scales and one per chunk for
+			// the data, plus the single 4-byte global-scale write:
+			// 1+2*ceil(n/1008), where 1008 is 1000 rounded up to a whole
+			// number of 16-element blocks. The pre-S9 code wrote once
+			// per block for each pass.
+			if want := 1 + 2*int((n+1007)/1008); cw.calls != want {
+				t.Errorf("nvfp4 writes = %d, want %d (one per chunk per pass + global scale)", cw.calls, want)
+			}
+		})
 	}
 }

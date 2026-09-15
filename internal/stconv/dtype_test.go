@@ -29,6 +29,58 @@ func TestF16RoundTrip(t *testing.T) {
 	}
 }
 
+// f16ToF32Ref is the pre-S2 float64-arithmetic f16 decoder (math.Pow
+// based), kept verbatim as the oracle for
+// TestF16ToF32Exhaustive. It must not be updated when f16ToF32 changes.
+func f16ToF32Ref(bits uint16) float32 {
+	sign := bits >> 15
+	exp := (bits >> 10) & 0x1F
+	man := bits & 0x3FF
+
+	var val float64
+	switch {
+	case exp == 0x1F:
+		if man == 0 {
+			val = math.Inf(1)
+		} else {
+			val = math.NaN()
+		}
+	case exp == 0:
+		val = float64(man) / 1024 * math.Pow(2, -14)
+	default:
+		val = (1 + float64(man)/1024) * math.Pow(2, float64(exp)-15)
+	}
+	if sign == 1 {
+		val = -val
+	}
+	return float32(val)
+}
+
+// TestF16ToF32Exhaustive checks the bit-manipulation f16ToF32 against the
+// float64-arithmetic reference for all 65536 uint16 patterns. f16->f32 is
+// an exact conversion, so non-NaN results must agree bit-for-bit; NaNs are
+// compared by class and sign only, because the reference canonicalizes to
+// Go's quiet NaN while the bit decoder carries the f16 payload over (the
+// plan's "all-ones exponent + nonzero mantissa" pattern).
+func TestF16ToF32Exhaustive(t *testing.T) {
+	for i := 0; i < 65536; i++ {
+		u := uint16(i)
+		got := f16ToF32(u)
+		want := f16ToF32Ref(u)
+		if math.IsNaN(float64(want)) {
+			if !math.IsNaN(float64(got)) || math.Signbit(float64(got)) != math.Signbit(float64(want)) {
+				t.Fatalf("f16ToF32(%04x) = %08x, want a NaN with sign %v (ref %08x)",
+					u, math.Float32bits(got), math.Signbit(float64(want)), math.Float32bits(want))
+			}
+			continue
+		}
+		if math.Float32bits(got) != math.Float32bits(want) {
+			t.Fatalf("f16ToF32(%04x) = %08x (%v), want %08x (%v)",
+				u, math.Float32bits(got), got, math.Float32bits(want), want)
+		}
+	}
+}
+
 func TestBF16RoundTrip(t *testing.T) {
 	cases := []float32{0, 1, -1, 100.5, 12345.6, -0.001}
 	for _, c := range cases {
@@ -138,6 +190,398 @@ func TestF8E5M2Max(t *testing.T) {
 	got = f8E5M2ToF32(f32ToF8E5M2(1e9))
 	if !math.IsInf(float64(got), 1) {
 		t.Errorf("expected +Inf, got %v", got)
+	}
+}
+
+// f32ToF8E4M3Ref is the pre-S3 Frexp/Round e4m3 encoder, kept verbatim as
+// the oracle for TestF32ToF8EncodersOracle. It must not be updated when
+// f32ToF8E4M3 changes.
+func f32ToF8E4M3Ref(f float32) uint8 {
+	sign := uint8(0)
+	if math.Signbit(float64(f)) {
+		sign = 0x80
+	}
+	af := math.Abs(float64(f))
+
+	if math.IsNaN(float64(f)) {
+		return sign | 0x7F
+	}
+	if math.IsInf(float64(f), 0) {
+		return sign | 0x7F // no Inf; saturate into the NaN pattern
+	}
+	if af == 0 {
+		return sign
+	}
+
+	const manBits = 3
+	const denom = 1 << manBits // 8
+	const bias = 7
+
+	frac, exp := math.Frexp(af)
+	m := frac * 2
+	e := int32(exp) - 1
+	biasedExp := e + bias
+
+	if biasedExp < 1 {
+		// Subnormal range; smallest normal is 2^(1-bias) = 2^-6.
+		val := af / math.Pow(2, 1-bias) * denom
+		man := int32(math.Round(val))
+		if man <= 0 {
+			return sign
+		}
+		if man >= denom {
+			return sign | (1 << manBits) // rounds up into smallest normal
+		}
+		return sign | uint8(man)
+	}
+
+	manF := math.Round((m - 1) * denom)
+	if manF >= denom {
+		manF = 0
+		biasedExp++
+	}
+	const maxExp = 0xF // 4 exponent bits, all-ones is usable except mantissa==7
+	if biasedExp > maxExp {
+		// True overflow (beyond even the NaN-adjacent max): saturate into
+		// the NaN pattern, since e4m3fn has no infinity to represent this.
+		return sign | 0x7F
+	}
+	if biasedExp == maxExp && manF >= 7 {
+		// This exact bit pattern is reserved for NaN.
+		return sign | 0x7F
+	}
+	return sign | uint8(biasedExp)<<manBits | uint8(manF)
+}
+
+// f32ToF8E5M2Ref is the pre-S3 Frexp/Round e5m2 encoder, kept verbatim as
+// the oracle for TestF32ToF8EncodersOracle. It must not be updated when
+// f32ToF8E5M2 changes.
+func f32ToF8E5M2Ref(f float32) uint8 {
+	sign := uint8(0)
+	if math.Signbit(float64(f)) {
+		sign = 0x80
+	}
+	af := math.Abs(float64(f))
+
+	if math.IsNaN(float64(f)) {
+		return sign | 0x7F // exp=11111, man=11 -> NaN
+	}
+	if math.IsInf(float64(f), 0) {
+		return sign | 0x7C // exp=11111, man=00 -> Inf
+	}
+	if af == 0 {
+		return sign
+	}
+
+	const manBits = 2
+	const denom = 1 << manBits // 4
+	const bias = 15
+
+	frac, exp := math.Frexp(af)
+	m := frac * 2
+	e := int32(exp) - 1
+	biasedExp := e + bias
+
+	if biasedExp < 1 {
+		val := af / math.Pow(2, 1-bias) * denom
+		man := int32(math.Round(val))
+		if man <= 0 {
+			return sign
+		}
+		if man >= denom {
+			return sign | (1 << manBits)
+		}
+		return sign | uint8(man)
+	}
+
+	manF := math.Round((m - 1) * denom)
+	if manF >= denom {
+		manF = 0
+		biasedExp++
+	}
+	if biasedExp >= 0x1F {
+		return sign | 0x7C // overflow -> Inf
+	}
+	return sign | uint8(biasedExp)<<manBits | uint8(manF)
+}
+
+// fp8EdgeCorpus builds the structured edge corpus for
+// TestF32ToF8EncodersOracle: the subnormal/normal boundary regions of both
+// formats, exact mantissa midpoints at every f32 exponent (the half-away
+// ties), the saturation boundaries (+/-448 for e4m3, +/-57344 for e5m2) and
+// their ULP neighbors, zero, f32 denormals, +/-Inf, NaN payloads, the
+// 0x7F/Inf-adjacent values, and the extremes.
+func fp8EdgeCorpus() []float32 {
+	var c []float32
+	add := func(f ...float32) { c = append(c, f...) }
+	// ulpAround adds x plus n ULPs of f32 in each direction from x.
+	ulpAround := func(x float32, n int) {
+		dn, up := x, x
+		for i := 0; i < n; i++ {
+			dn = math.Nextafter32(dn, 0)
+			up = math.Nextafter32(up, 1)
+			add(dn, up)
+		}
+		add(x)
+	}
+
+	// e4m3: subnormal step 2^-9, smallest normal 2^-6, flush at 2^-10.
+	step4 := float32(math.Ldexp(1, -9))
+	for k := 0; k <= 16; k++ {
+		// Subnormal units k*2^-9 and the half-away ties (k+0.5)*2^-9.
+		add(float32(k)*step4, (float32(k)+0.5)*step4)
+	}
+	ulpAround(float32(math.Ldexp(1, -10)), 4)             // flush boundary
+	ulpAround(step4, 4)                                   // 2^-9 +/- a few ULPs
+	ulpAround(float32(1.5)*step4, 4)                      // 1.5-unit tie
+	ulpAround(float32(math.Ldexp(1, -6)), 4)              // smallest normal
+	ulpAround(float32(1.5)*float32(math.Ldexp(1, -6)), 4) // 7.5-unit tie: rounds up into the smallest normal
+
+	// e5m2: subnormal step 2^-16, smallest normal 2^-14, flush at 2^-17.
+	step5 := float32(math.Ldexp(1, -16))
+	for k := 0; k <= 10; k++ {
+		add(float32(k)*step5, (float32(k)+0.5)*step5)
+	}
+	ulpAround(float32(math.Ldexp(1, -17)), 4)              // flush boundary
+	ulpAround(step5, 4)                                    // 2^-16 +/- a few ULPs
+	ulpAround(float32(1.5)*step5, 4)                       // 1.5-unit tie
+	ulpAround(float32(math.Ldexp(1, -14)), 4)              // smallest normal
+	ulpAround(float32(1.5)*float32(math.Ldexp(1, -14)), 4) // 3.5-unit tie: rounds up into the smallest normal
+
+	// Exact mantissa midpoints at every f32 exponent (the half-away ties).
+	// e4m3 midpoint at unbiased exponent e, k: (1+(k+0.5)/8)*2^e =
+	// (16+2k+1)*2^(e-4); e5m2: (1+(k+0.5)/4)*2^e = (8+2k+1)*2^(e-3).
+	// Both are odd*2^int, so exact in f32 across the whole exponent range
+	// (below 2^-126 they are exact f32 subnormals).
+	for e := -126; e <= 127; e++ {
+		for k := 0; k < 8; k++ {
+			add(float32(math.Ldexp(float64(16+2*k+1), e-4)))
+		}
+		for k := 0; k < 4; k++ {
+			add(float32(math.Ldexp(float64(8+2*k+1), e-3)))
+		}
+	}
+
+	// Saturation boundaries, ULP neighbors, and the 0x7F/Inf-adjacent
+	// values.
+	ulpAround(448, 4) // e4m3 max finite
+	ulpAround(-448, 4)
+	ulpAround(464, 2) // 448/480 tie -> 0x7F
+	ulpAround(-464, 2)
+	ulpAround(480, 2) // the 0x7F pattern's value
+	ulpAround(-480, 2)
+	ulpAround(496, 2) // carry boundary -> 0x7F
+	ulpAround(-496, 2)
+	ulpAround(57344, 4) // e5m2 max finite
+	ulpAround(-57344, 4)
+	ulpAround(61440, 2) // 57344/65536 tie -> Inf
+	ulpAround(-61440, 2)
+
+	// Zero, f32 denormals (all flush to zero in fp8), +/-Inf, NaN payloads,
+	// extremes.
+	add(0, math.Float32frombits(0x80000000)) // -0
+	add(math.SmallestNonzeroFloat32, math.Float32frombits(1<<22),
+		math.Float32frombits(0x400000), math.Float32frombits(0x7FFFFF))
+	add(-math.SmallestNonzeroFloat32, math.Float32frombits(0x80000001),
+		math.Float32frombits(0xC0000000), math.Float32frombits(0xFF7FFFFF))
+	add(math.Float32frombits(0x7F800000), math.Float32frombits(0xFF800000)) // +/-Inf
+	add(math.Float32frombits(0x7FC00000), math.Float32frombits(0xFFC00000),
+		math.Float32frombits(0x7F800001), math.Float32frombits(0xFF800001),
+		math.Float32frombits(0x7FFFFFFF), math.Float32frombits(0xFFFFFFFF))
+	add(math.MaxFloat32, -math.MaxFloat32, 1e30, -1e30)
+	return c
+}
+
+// TestF32ToF8EncodersOracle checks the bit-manipulation fp8 encoders
+// against the Frexp-based references (f32ToF8E4M3Ref/f32ToF8E5M2Ref) for
+// 1,000,000 random f32 bit patterns (fixed seed) plus the structured edge
+// corpus from fp8EdgeCorpus. The new encoders must agree with the
+// references bit-for-bit on every input.
+func TestF32ToF8EncodersOracle(t *testing.T) {
+	check := func(f float32) {
+		if got, want := f32ToF8E4M3(f), f32ToF8E4M3Ref(f); got != want {
+			t.Errorf("f32ToF8E4M3(%08x) = %02x, want %02x (ref)",
+				math.Float32bits(f), got, want)
+		}
+		if got, want := f32ToF8E5M2(f), f32ToF8E5M2Ref(f); got != want {
+			t.Errorf("f32ToF8E5M2(%08x) = %02x, want %02x (ref)",
+				math.Float32bits(f), got, want)
+		}
+	}
+
+	rng := rand.New(rand.NewSource(11))
+	for i := 0; i < 1000000; i++ {
+		check(math.Float32frombits(rng.Uint32()))
+	}
+	for _, f := range fp8EdgeCorpus() {
+		check(f)
+	}
+}
+
+// f32ToInt8Ref is the pre-S4 float64-based int8 quantizer (math.Round,
+// half-away-from-zero), kept verbatim as the oracle for
+// TestInt8Int4QuantizeOracle. S4 prototyped an f32-only rewrite that is
+// byte-identical to this reference but ~2.1x slower on this machine, so
+// f32ToInt8 keeps the float64 implementation and this ref currently
+// mirrors it; it must not be updated when f32ToInt8 changes.
+func f32ToInt8Ref(f, scale float32) int8 {
+	if math.IsNaN(float64(f)) {
+		return 0
+	}
+	if scale == 0 {
+		return 0
+	}
+	q := math.Round(float64(f / scale))
+	if q > 127 {
+		q = 127
+	}
+	if q < -127 {
+		q = -127
+	}
+	return int8(q)
+}
+
+// f32ToInt4RNERef is the pre-S4 float64-based int4 RNE quantizer, kept
+// verbatim as the oracle for TestInt8Int4QuantizeOracle. It must not be
+// updated when f32ToInt4RNE changes.
+func f32ToInt4RNERef(f, scale float32) int8 {
+	if scale == 0 {
+		return 0
+	}
+	if math.IsNaN(float64(f)) {
+		return 0
+	}
+	if math.IsInf(float64(f), 0) {
+		if math.Signbit(float64(f)) {
+			return -7
+		}
+		return 7
+	}
+	v := f / scale
+	av := math.Abs(float64(v))
+	// Clamp in float space before int32(av): the conversion is
+	// implementation-defined once av exceeds the int32 range, and the
+	// post-conversion q > 7 clamp below would never see the overflow.
+	// av < 8 keeps the int32 path in range; the q > 7 clamp still handles
+	// the 7.5 -> 8 RNE tie. Mirrors f32ToInt8's float-space clamping.
+	if !(av < 8) {
+		if math.Signbit(float64(f)) {
+			return -7
+		}
+		return 7
+	}
+	q := int32(av)
+	frac := av - float64(q)
+	switch {
+	case frac > 0.5:
+		q++
+	case frac == 0.5 && q%2 == 1:
+		q++
+	}
+	if q > 7 {
+		q = 7
+	}
+	if math.Signbit(float64(f)) {
+		q = -q
+	}
+	return int8(q)
+}
+
+// TestInt8Int4QuantizeOracle checks f32ToInt8/f32ToInt4RNE against the
+// float64 references for 1,000,000 random (f, scale) pairs - f an
+// arbitrary f32 bit pattern, scale = +/-2^e * u with e in -60..60 and u in
+// [0.5, 1), so the quotients land at every exponent and on the clamp
+// paths - plus an explicit edge table: rounding midpoints with their f32
+// ULP neighbors, the float-space clamp boundaries, quotients at the 2^k
+// +- 0.5 corners, exact midpoints through non-unit scales, and the
+// special values (NaN, +/-Inf, scale 0, scale NaN, Inf/Inf quotients).
+// The f32ToInt4RNE comparison is the load-bearing one: f32ToInt4RNE is
+// the S4 f32-only rewrite and must agree with the float64 reference on
+// every pair. The f32ToInt8 comparison guards that f32ToInt8 (kept as the
+// float64 implementation for speed) keeps agreeing with the reference.
+// Both implementations must agree with the references on every pair.
+func TestInt8Int4QuantizeOracle(t *testing.T) {
+	check := func(f, scale float32) {
+		if got, want := f32ToInt8(f, scale), f32ToInt8Ref(f, scale); got != want {
+			t.Errorf("f32ToInt8(%g, %g) = %d, want %d (ref)", f, scale, got, want)
+		}
+		if got, want := f32ToInt4RNE(f, scale), f32ToInt4RNERef(f, scale); got != want {
+			t.Errorf("f32ToInt4RNE(%g, %g) = %d, want %d (ref)", f, scale, got, want)
+		}
+	}
+
+	rng := rand.New(rand.NewSource(42))
+	for i := 0; i < 1000000; i++ {
+		f := math.Float32frombits(rng.Uint32())
+		e := rng.Intn(121) - 60
+		scale := float32(math.Pow(2, float64(e))) * (0.5 + rng.Float32()*0.5)
+		if rng.Intn(2) == 1 {
+			scale = -scale
+		}
+		check(f, scale)
+	}
+
+	// Rounding midpoints and clamp boundaries at scale = 1, each with its
+	// two f32 ULP neighbors, so the tie handling is pinned at the
+	// boundary. (0x3EFFFFFF = 0.5-2^-25 is the f32 just below 0.5: the
+	// corner where q+0.5 is an inexact f32 tie that rounds up to 1.0.)
+	midpoints := []float32{
+		126.5, 127, 127.4999, 7.5, 7.0, 6.5,
+		0.5, 1.5, 2.5, 3.5, 4.5, 5.5,
+	}
+	for _, m := range midpoints {
+		for _, s := range []float32{m, -m} {
+			b := math.Float32bits(s)
+			check(math.Float32frombits(b-1), 1)
+			check(s, 1)
+			check(math.Float32frombits(b+1), 1)
+		}
+	}
+
+	// Quotients at the 2^k +- 0.5 corners (k = -4..7): q = 2^k - 0.5 and
+	// the f32 just below 2^k are where the q +- 0.5 sum's exactness
+	// argument is stressed; 2^k +- 0.5 are the tie points. At k = 7 these
+	// double as the 127.5 clamp-boundary midpoints.
+	for k := -4; k <= 7; k++ {
+		pb := uint32(k+127) << 23 // bit pattern of 2^k
+		check(math.Float32frombits(pb)-0.5, 1)
+		check(math.Float32frombits(pb-1), 1)
+		check(math.Float32frombits(pb), 1)
+		check(math.Float32frombits(pb)+0.5, 1)
+	}
+
+	// Exact midpoints reached through non-unit scales: the quotient is the
+	// f32 division result, not a literal.
+	for _, ps := range []struct{ f, scale float32 }{
+		{253, 2}, {255, 2}, {254, 2}, {15, 2}, {13, 2}, {5, 2}, {3, 2}, {1, 2},
+		{253, -2}, {-255, 2}, {1023, 8}, {7.5, 1.5},
+	} {
+		check(ps.f, ps.scale)
+	}
+
+	// Special values: NaN, +/-Inf, scale 0, scale NaN, and Inf/Inf
+	// quotients (the one corner where a NaN quotient reaches the
+	// float->int conversion; both sides do the same conversion).
+	for _, ps := range []struct{ f, scale float32 }{
+		{math.Float32frombits(0x7fc00000), 1},
+		{math.Float32frombits(0xffc00000), 1},
+		{math.Float32frombits(0x7fc00000), 0},
+		{math.Float32frombits(0xffc00000), 0},
+		{float32(math.Inf(1)), 1},
+		{float32(math.Inf(-1)), 1},
+		{float32(math.Inf(1)), 0.25},
+		{float32(math.Inf(-1)), 0.25},
+		{float32(math.Inf(1)), 0},
+		{float32(math.Inf(-1)), 0},
+		{float32(math.Inf(1)), float32(math.Inf(1))},
+		{float32(math.Inf(-1)), float32(math.Inf(-1))},
+		{1.5, 0},
+		{100, 0},
+		{1.5, math.Float32frombits(0x7fc00000)},
+		{float32(math.Inf(1)), math.Float32frombits(0x7fc00000)},
+		{126.5, math.Float32frombits(0x7fc00000)},
+	} {
+		check(ps.f, ps.scale)
 	}
 }
 

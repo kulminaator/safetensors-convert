@@ -35,6 +35,7 @@ type ConvertOptions struct {
 	Protect     bool       // apply the built-in default precision policy (protect.go); the CLI sets this explicitly per run
 	MinElems    int        // tensors with fewer elements than this are never converted (0 disables)
 	ChunkElems  int        // 0 -> DefaultChunkElems
+	Progress    *Progress  // live progress reporter (nil = no progress output); the CLI sets it when -quiet is off
 }
 
 // TensorStat reports what actually happened to one tensor during a run.
@@ -193,6 +194,13 @@ func ConvertModel(opts ConvertOptions) ([]TensorStat, error) {
 		return nil, err
 	}
 
+	// The progress reporter (if any) counts tensors, and the plan is the
+	// one place the run's tensor count is known: set the total before the
+	// first tensor's Begin.
+	if opts.Progress != nil {
+		opts.Progress.SetTotal(len(plans))
+	}
+
 	// Multi-shard runs tag each stat with its source shard filename so the
 	// report can show where a tensor came from; single-file runs leave it
 	// empty, matching the pre-multi-shard report.
@@ -236,9 +244,15 @@ func ConvertModel(opts ConvertOptions) ([]TensorStat, error) {
 	}
 	defer closeFiles(shards)
 
+	// One pass scratch for the whole run (see passScratch): allocated
+	// here, before the tensor loop, and reused for every tensor -
+	// tensors are processed strictly one at a time, so its buffers never
+	// overlap. Its sizes depend only on chunkElems.
+	scratch := newPassScratch(chunkElems)
+
 	stats := make([]TensorStat, 0, len(plans))
 	for _, p := range plans {
-		stat, err := convertTensor(p, shards[p.srcShard], bw, chunkElems)
+		stat, err := convertTensor(p, shards[p.srcShard], bw, chunkElems, scratch, opts.Progress)
 		if err != nil {
 			return nil, err
 		}
@@ -367,9 +381,15 @@ func convertModelToShards(opts ConvertOptions, plans []tensorPlan, sources []str
 		bws[i] = bufio.NewWriterSize(f, 4<<20)
 	}
 
+	// One pass scratch for the whole run (see passScratch): allocated
+	// here, before the tensor loop, and reused for every tensor -
+	// tensors are processed strictly one at a time, so its buffers never
+	// overlap. Its sizes depend only on chunkElems.
+	scratch := newPassScratch(chunkElems)
+
 	stats := make([]TensorStat, 0, len(plans))
 	for _, p := range plans {
-		stat, err := convertTensor(p, shards[p.srcShard], bws[outShardOf[p.srcShard]], chunkElems)
+		stat, err := convertTensor(p, shards[p.srcShard], bws[outShardOf[p.srcShard]], chunkElems, scratch, opts.Progress)
 		if err != nil {
 			return nil, err
 		}
@@ -666,6 +686,22 @@ func (cw *countingWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// progressAdder reports each successful write to the progress reporter,
+// so a pass without its own chunk loop (the passthrough's io.Copy) still
+// reports one Add per copied chunk, like the converting passes.
+type progressAdder struct {
+	w    io.Writer
+	prog *Progress
+}
+
+func (p *progressAdder) Write(b []byte) (int, error) {
+	n, err := p.w.Write(b)
+	if n > 0 {
+		p.prog.Add(int64(n))
+	}
+	return n, err
+}
+
 // checkWritten is convertTensor's plan/stream guard, run before it
 // returns success: the bytes actually written for p must equal
 // p.totalOutLen() (owner plus all sibling tensors). A mismatch means the
@@ -679,38 +715,199 @@ func checkWritten(p tensorPlan, cw *countingWriter) error {
 	return nil
 }
 
+// maxElementSize is the largest element size among the convertible
+// source dtypes (F16/BF16/F32/F64). The per-run pass scratch is sized
+// before any tensor is read, and the source dtype varies per tensor, so
+// its raw buffers must hold the worst case.
+const maxElementSize = 8
+
+// passScratch is the working buffers of the streaming conversion passes,
+// allocated once per run (in ConvertModel / convertModelToShards, before
+// the tensor loop) and shared by every pass of every tensor. It exists
+// because the passes used to make() their own chunk-sized buffers per
+// tensor: on a real run (~376 tensors x several MB) that is multi-GB of
+// transient allocation churn for buffers that are always the same size.
+//
+// The scratch is reused across tensors because tensors are processed
+// strictly one at a time: the plan loop runs each tensor's passes to
+// completion before starting the next tensor, and within a tensor the
+// passes run sequentially (scan, then quantize, ...), so no two passes
+// are ever in flight at once. The one-shot wrappers (toFloat32Slice,
+// packNibbles) and the tests keep allocating their own buffers: they are
+// not on the per-tensor hot path.
+//
+// Every size depends only on chunkElems (and the fixed format
+// constants), never on the tensor or the file: the total is
+// passScratchSize(chunkElems), O(chunk) x a small constant (memory
+// rule). The raw buffers are sized for maxElementSize (8 bytes, F64) for
+// the same reason as above.
+type passScratch struct {
+	// raw1/raw2 are the double-buffered raw input: the current chunk (or
+	// convrot window) and the prefetch target of the next one (the S10
+	// double-buffer pattern, +1 raw buffer over the serial path). Sized
+	// for the max window at maxElementSize, so every pass's raw read
+	// fits.
+	raw1, raw2 []byte
+	// fbuf is the f32 decode scratch of the per-element passes (scan,
+	// fp8, int8, int4, mxfp4, nvfp4), sized for the max window.
+	fbuf []float32
+	// out is the fp8/int8 encoded output (1 byte per element), max window.
+	out []byte
+	// packedInt4 is the int4 packed output (2 elements per byte), max
+	// window.
+	packedInt4 []byte
+	// mxfp4Scales / mxfp4Packed are the mxfp4 block passes' per-chunk
+	// scale bytes (one E8M0 per 32-element block) and packed output.
+	mxfp4Scales []byte
+	mxfp4Packed []byte
+	// mxfp4Qs is the mxfp4 data pass' per-worker quantized-value
+	// scratch: one slice per fan-out worker (bounded by the CPU count,
+	// never the chunk or tensor), each at most mxfp4Block uint8.
+	mxfp4Qs [][]uint8
+	// nvfp4Scales / nvfp4Packed / nvfp4Qs are the nvfp4 counterparts
+	// (one E4M3 scale per 16-element block).
+	nvfp4Scales []byte
+	nvfp4Packed []byte
+	nvfp4Qs     [][]uint8
+	// convrotGroups holds one 256-element f32 buffer per rotation group
+	// in the max window (the rotated values), the convrot pass' group
+	// buffers.
+	convrotGroups [][convrotGroup]float32
+	// results is the scan pass' per-worker max: one float32 per fan-out
+	// worker at the max window's parallelism (bounded by the CPU count).
+	results []float32
+}
+
+// maxWindowElems is the largest element window any streaming pass reads
+// for a given chunkElems: the convrot window rounding (up to the next
+// multiple of 256, at least one group). A multiple of 256 is a multiple
+// of the mxfp4 (32) and nvfp4 (16) block sizes and of 2 (int4's even
+// rounding), and >= chunkElems itself, so it covers every pass's
+// effective chunk for the same chunkElems.
+func maxWindowElems(chunkElems int) int64 {
+	return int64((chunkElems + convrotGroup - 1) / convrotGroup * convrotGroup)
+}
+
+// passScratchSize is the total byte size of a passScratch for a given
+// chunkElems - the documented bound, O(chunk) x a small constant. With
+// w = maxWindowElems(chunkElems):
+//
+//	2 * w * 8                          raw1 + raw2 (max element size 8)
+//	+ w * 4                            fbuf (f32 decode)
+//	+ w                                out (1 byte/elem)
+//	+ (w+1)/2                          packedInt4 (2 elems/byte)
+//	+ w/32 + (w+1)/2                   mxfp4Scales + mxfp4Packed
+//	+ max(1, parallelism(w/32)) * 32   mxfp4Qs (per worker, mxfp4Block)
+//	+ w/16 + (w+1)/2                   nvfp4Scales + nvfp4Packed
+//	+ max(1, parallelism(w/16)) * 16   nvfp4Qs (per worker, nvfp4Block)
+//	+ w * 4                            convrotGroups (one f32/elem)
+//	+ max(1, parallelism(w)) * 4       results (per worker, one f32)
+//
+// The parallelism terms are bounded by the CPU count, never the chunk or
+// the tensor. chunkElems is the run's normalized chunk size
+// (ConvertModel substitutes DefaultChunkElems for <= 0).
+func passScratchSize(chunkElems int) int64 {
+	w := maxWindowElems(chunkElems)
+	return 2*w*maxElementSize +
+		w*4 +
+		w +
+		(w+1)/2 +
+		w/mxfp4Block + (w+1)/2 +
+		int64(max(1, parallelism(int(w/mxfp4Block))))*mxfp4Block +
+		w/nvfp4Block + (w+1)/2 +
+		int64(max(1, parallelism(int(w/nvfp4Block))))*nvfp4Block +
+		w*4 +
+		int64(max(1, parallelism(int(w))))*4
+}
+
+// newPassScratch allocates a passScratch for one run: every buffer at
+// exactly the size passScratchSize accounts for (see the formula there),
+// so the run's pass-buffer memory is the documented bound.
+func newPassScratch(chunkElems int) *passScratch {
+	w := maxWindowElems(chunkElems)
+	sc := &passScratch{
+		raw1:          make([]byte, w*maxElementSize),
+		raw2:          make([]byte, w*maxElementSize),
+		fbuf:          make([]float32, w),
+		out:           make([]byte, w),
+		packedInt4:    make([]byte, (w+1)/2),
+		mxfp4Scales:   make([]byte, w/mxfp4Block),
+		mxfp4Packed:   make([]byte, (w+1)/2),
+		nvfp4Scales:   make([]byte, w/nvfp4Block),
+		nvfp4Packed:   make([]byte, (w+1)/2),
+		convrotGroups: make([][convrotGroup]float32, w/convrotGroup),
+		results:       make([]float32, max(1, parallelism(int(w)))),
+	}
+	sc.mxfp4Qs = make([][]uint8, max(1, parallelism(int(w/mxfp4Block))))
+	for i := range sc.mxfp4Qs {
+		sc.mxfp4Qs[i] = make([]uint8, mxfp4Block)
+	}
+	sc.nvfp4Qs = make([][]uint8, max(1, parallelism(int(w/nvfp4Block))))
+	for i := range sc.nvfp4Qs {
+		sc.nvfp4Qs[i] = make([]uint8, nvfp4Block)
+	}
+	return sc
+}
+
 // convertTensor streams one planned tensor from src - its source shard
 // file, already open by the caller - to w, reading from the plan's
 // shard-relative offset. Every byte of the tensor's output (owner plus
 // siblings) goes through a countingWriter so checkWritten can verify the
 // written count against the plan; on any plan/stream disagreement it
-// fails the run instead of emitting a corrupt file.
-func convertTensor(p tensorPlan, src io.ReaderAt, w io.Writer, chunkElems int) (TensorStat, error) {
+// fails the run instead of emitting a corrupt file. sc is the run's
+// pass scratch (see passScratch): the passes use its buffers instead of
+// allocating their own per tensor. prog is the run's progress reporter
+// (nil = no progress output): convertTensor brackets the tensor with
+// Begin/End, and the passes report one Add per chunk.
+func convertTensor(p tensorPlan, src io.ReaderAt, w io.Writer, chunkElems int, sc *passScratch, prog *Progress) (TensorStat, error) {
 	cw := &countingWriter{w: w}
 	stat := TensorStat{Name: p.name, FromDType: p.srcInfo.DType, ToDType: p.outDType, NumElems: p.numElems, ProtectOverride: p.protectOverride}
 
+	// Start the tensor's progress line before any of its bytes move, so
+	// the line is live for the whole tensor. totalWork is the tensor's
+	// total bytes of work (see tensorTotalWork) - a display-only
+	// accounting that never affects the output bytes.
+	if prog != nil {
+		prog.Begin(p.name, p.srcInfo.DType, p.outDType, tensorTotalWork(p))
+	}
+	// End is called only on success: a failed tensor leaves its line
+	// unfinished - the next tensor's Begin finalizes it (Progress's
+	// defensive path), or the run ends and the line simply stops
+	// updating. success is set only on the final return, so every error
+	// path skips it.
+	success := false
+	defer func() {
+		if success && prog != nil {
+			prog.End()
+		}
+	}()
+
 	if p.skippedWhy != "" {
 		stat.SkippedWhy = p.skippedWhy
-		if err := copyRaw(src, cw, p.srcAbsOffset, p.srcLen); err != nil {
+		if err := copyRaw(src, cw, p.srcAbsOffset, p.srcLen, prog); err != nil {
 			return stat, fmt.Errorf("copying tensor %q: %w", p.name, err)
 		}
-		return stat, checkWritten(p, cw)
+		if err := checkWritten(p, cw); err != nil {
+			return stat, err
+		}
+		success = true
+		return stat, nil
 	}
 
 	switch p.target {
 	case TargetFP8E4M3, TargetFP8E5M2:
 		e4m3 := p.target == TargetFP8E4M3
-		if err := streamConvertFP8(src, cw, p.srcAbsOffset, p.srcInfo.DType, p.numElems, chunkElems, e4m3); err != nil {
+		if err := streamConvertFP8(src, cw, p.srcAbsOffset, p.srcInfo.DType, p.numElems, chunkElems, e4m3, sc, prog); err != nil {
 			return stat, fmt.Errorf("converting tensor %q: %w", p.name, err)
 		}
 
 	case TargetInt8:
-		maxAbs, err := streamComputeMaxAbsScale(src, p.srcAbsOffset, p.srcInfo.DType, p.numElems, chunkElems)
+		maxAbs, err := streamComputeMaxAbsScale(src, p.srcAbsOffset, p.srcInfo.DType, p.numElems, chunkElems, sc, prog)
 		if err != nil {
 			return stat, fmt.Errorf("scanning tensor %q: %w", p.name, err)
 		}
 		scale := int8Scale(maxAbs)
-		if err := streamConvertInt8(src, cw, p.srcAbsOffset, p.srcInfo.DType, p.numElems, chunkElems, scale); err != nil {
+		if err := streamConvertInt8(src, cw, p.srcAbsOffset, p.srcInfo.DType, p.numElems, chunkElems, scale, sc, prog); err != nil {
 			return stat, fmt.Errorf("converting tensor %q: %w", p.name, err)
 		}
 		stat.Scale = scale
@@ -719,12 +916,12 @@ func convertTensor(p tensorPlan, src io.ReaderAt, w io.Writer, chunkElems int) (
 		}
 
 	case TargetInt4:
-		maxAbs, err := streamComputeMaxAbsScale(src, p.srcAbsOffset, p.srcInfo.DType, p.numElems, chunkElems)
+		maxAbs, err := streamComputeMaxAbsScale(src, p.srcAbsOffset, p.srcInfo.DType, p.numElems, chunkElems, sc, prog)
 		if err != nil {
 			return stat, fmt.Errorf("scanning tensor %q: %w", p.name, err)
 		}
 		scale := int4Scale(maxAbs)
-		if err := streamInt4Data(src, cw, p.srcAbsOffset, p.srcInfo.DType, p.numElems, scale, chunkElems); err != nil {
+		if err := streamInt4Data(src, cw, p.srcAbsOffset, p.srcInfo.DType, p.numElems, scale, chunkElems, sc, prog); err != nil {
 			return stat, fmt.Errorf("converting tensor %q: %w", p.name, err)
 		}
 		stat.Scale = scale
@@ -735,7 +932,7 @@ func convertTensor(p tensorPlan, src io.ReaderAt, w io.Writer, chunkElems int) (
 	case TargetInt8ConvRot:
 		// The row-scale sibling precedes the owner in the file, so the
 		// pass writes scales first, then the rotated I8 data, to cw.
-		rows, err := streamConvRot(src, cw, p.srcAbsOffset, p.srcInfo.DType, p.srcInfo.Shape, p.numElems, chunkElems)
+		rows, err := streamConvRot(src, cw, p.srcAbsOffset, p.srcInfo.DType, p.srcInfo.Shape, p.numElems, chunkElems, sc, prog)
 		if err != nil {
 			return stat, fmt.Errorf("converting tensor %q: %w", p.name, err)
 		}
@@ -745,7 +942,7 @@ func convertTensor(p tensorPlan, src io.ReaderAt, w io.Writer, chunkElems int) (
 		// The block-scale sibling precedes the owner in the file, so the
 		// pass writes the E8M0 block scales first, then the packed E2M1
 		// data, to cw.
-		if err := streamMxFP4(src, cw, p.srcAbsOffset, p.srcInfo.DType, p.numElems, chunkElems); err != nil {
+		if err := streamMxFP4(src, cw, p.srcAbsOffset, p.srcInfo.DType, p.numElems, chunkElems, sc, prog); err != nil {
 			return stat, fmt.Errorf("converting tensor %q: %w", p.name, err)
 		}
 
@@ -753,7 +950,7 @@ func convertTensor(p tensorPlan, src io.ReaderAt, w io.Writer, chunkElems int) (
 		// The ".global_scale" and ".block_scale" siblings both precede
 		// the owner in the file, so the pass writes the F32 global scale,
 		// the E4M3 block scales, then the packed E2M1 data, to cw.
-		alpha, err := streamNVFP4(src, cw, p.srcAbsOffset, p.srcInfo.DType, p.numElems, chunkElems)
+		alpha, err := streamNVFP4(src, cw, p.srcAbsOffset, p.srcInfo.DType, p.numElems, chunkElems, sc, prog)
 		if err != nil {
 			return stat, fmt.Errorf("converting tensor %q: %w", p.name, err)
 		}
@@ -763,7 +960,43 @@ func convertTensor(p tensorPlan, src io.ReaderAt, w io.Writer, chunkElems int) (
 		return stat, fmt.Errorf("tensor %q: unhandled target kind %v", p.name, p.target)
 	}
 
-	return stat, checkWritten(p, cw)
+	if err := checkWritten(p, cw); err != nil {
+		return stat, err
+	}
+	success = true
+	return stat, nil
+}
+
+// tensorTotalWork is the tensor's total bytes of work for the progress
+// line: the source bytes (srcLen) times the target's pass count. The
+// multiplier is a display choice - it scales the percentage, rate, and
+// eta only, and never the output bytes:
+//
+//	passthrough / none: srcLen x 1 (one copy)
+//	fp8 e4m3 / e5m2:    srcLen x 1 (one pass)
+//	int8, int4:         srcLen x 2 (max-abs scan + quantize)
+//	int8_convrot:       srcLen x 3 (scale scan + row rescan + quantize;
+//	                   each sweep walks every source byte, so this is a
+//	                   conservative lower bound - a multi-window row's
+//	                   quantize re-reads and re-rotates its head window,
+//	                   which is not counted)
+//	mxfp4:              srcLen x 2 (block-scale pass + data pass)
+//	nvfp4:              srcLen x 3 (global-max scan + block-scale pass +
+//	                   data pass)
+func tensorTotalWork(p tensorPlan) int64 {
+	if p.skippedWhy != "" {
+		return p.srcLen
+	}
+	var mult int64
+	switch p.target {
+	case TargetInt8, TargetInt4, TargetMxFP4:
+		mult = 2
+	case TargetInt8ConvRot, TargetNVFP4:
+		mult = 3
+	default: // TargetFP8E4M3, TargetFP8E5M2
+		mult = 1
+	}
+	return p.srcLen * mult
 }
 
 // appendHeaderEntry records one tensor's header entry given its already-
@@ -786,7 +1019,10 @@ func appendHeaderEntry(h *Header, name string, dtype DType, shape []int64, byteL
 // copyRaw streams length bytes starting at offset from r straight to w
 // without materializing the whole region in memory (io.Copy uses an
 // internal fixed-size buffer, not the section length).
-func copyRaw(r io.ReaderAt, w io.Writer, offset, length int64) error {
+func copyRaw(r io.ReaderAt, w io.Writer, offset, length int64, prog *Progress) error {
+	if prog != nil {
+		w = &progressAdder{w: w, prog: prog}
+	}
 	sr := io.NewSectionReader(r, offset, length)
 	_, err := io.Copy(w, sr)
 	return err
@@ -797,16 +1033,59 @@ func copyRaw(r io.ReaderAt, w io.Writer, offset, length int64) error {
 // scale (int8Scale, int4Scale) is derived from - without holding the whole
 // tensor in memory. NaN/Inf source values are ignored for the max (they'll
 // be clamped/handled at quantization time).
-func streamComputeMaxAbsScale(r io.ReaderAt, offset int64, srcDType DType, numElems int64, chunkElems int) (float32, error) {
+//
+// The per-chunk max loop is fanned out across cores (mapContiguous): each
+// worker scans a disjoint [lo, hi) sub-range of the decoded chunk into a
+// worker-local max, and the per-worker results are reduced after the join.
+// The decode itself stays serial: it is the only step that reads the
+// shared raw chunk, and the encode passes parallelize the same element
+// partition over their own loops.
+//
+// The chunk loop double-buffers the raw input: the first chunk is read
+// synchronously, and each later chunk is prefetched (in a goroutine) into
+// a second chunk-sized buffer while the previous chunk is being computed,
+// so the next chunk's read latency overlaps this chunk's CPU work. The
+// prefetch changes only timing - the bytes read and the result are
+// identical to the serial loop.
+func streamComputeMaxAbsScale(r io.ReaderAt, offset int64, srcDType DType, numElems int64, chunkElems int, sc *passScratch, prog *Progress) (float32, error) {
 	elemSize, err := srcDType.ByteSize()
 	if err != nil {
 		return 0, err
 	}
-	buf := make([]byte, chunkElems*elemSize)
+	// The per-pass buffers come from the run's passScratch (see
+	// passScratch): allocated once per run, sized to chunkElems, and
+	// reused across tensors - no per-tensor or per-chunk allocation.
+	buf := sc.raw1[:chunkElems*elemSize]
+	// buf2 is the prefetch (double-buffer) counterpart of buf: while chunk
+	// i is being scanned, the next chunk i+1 is read into buf2 in a
+	// goroutine. +1 raw chunk buffer over the serial path, bounded by the
+	// chunk (memory rule): both are chunk-sized, never tensor-sized.
+	buf2 := sc.raw2[:chunkElems*elemSize]
 	// One chunk-sized f32 scratch reused across all chunks: the decode
 	// fills at most chunkElems slots, so peak memory stays O(chunk) and
 	// no per-chunk allocation churn is left for the GC.
-	fbuf := make([]float32, chunkElems)
+	fbuf := sc.fbuf[:chunkElems]
+	// One float32 per fan-out worker for the worker-local max, reduced
+	// after the join. Sized parallelism(chunkElems): bounded by the CPU
+	// count, never by the chunk or tensor size (memory rule); parallelism
+	// is monotone in its argument, so the scratch's slice (sized for the
+	// max window) also covers every smaller final chunk.
+	results := sc.results[:max(1, parallelism(chunkElems))]
+
+	// The first chunk has no predecessor to overlap with, so it is read
+	// synchronously; every later chunk arrives via the previous
+	// iteration's prefetch (see below), already in buf. A zero-element
+	// tensor issues no read at all (the loop below never runs), matching
+	// the serial path.
+	if numElems > 0 {
+		firstN := int64(chunkElems)
+		if numElems < firstN {
+			firstN = numElems
+		}
+		if _, err := r.ReadAt(buf[:firstN*int64(elemSize)], offset); err != nil {
+			return 0, err
+		}
+	}
 
 	var maxAbs float32
 	var done int64
@@ -816,26 +1095,68 @@ func streamComputeMaxAbsScale(r io.ReaderAt, offset int64, srcDType DType, numEl
 			n = numElems - done
 		}
 		chunkBuf := buf[:n*int64(elemSize)]
-		if _, err := r.ReadAt(chunkBuf, offset+done*int64(elemSize)); err != nil {
-			return 0, err
+		// Prefetch the next chunk into buf2 before this chunk's scan, so
+		// its read latency overlaps this chunk's CPU work. The last chunk
+		// has no successor, so no prefetch is started for it.
+		var nextErr chan error
+		if done+n < numElems {
+			nextN := int64(chunkElems)
+			if rem := numElems - done - n; rem < nextN {
+				nextN = rem
+			}
+			nextOff := offset + (done+n)*int64(elemSize)
+			nextBuf := buf2
+			nextErr = make(chan error, 1)
+			go func() {
+				_, e := r.ReadAt(nextBuf[:nextN*int64(elemSize)], nextOff)
+				nextErr <- e
+			}()
 		}
 		floats, err := toFloat32SliceInto(fbuf, chunkBuf, srcDType)
 		if err != nil {
 			return 0, err
 		}
-		for _, f := range floats {
-			if math.IsNaN(float64(f)) || math.IsInf(float64(f), 0) {
-				continue
+		// Fan the max out over the chunk's disjoint fbuf sub-ranges: each
+		// worker touches only fbuf[lo:hi] and results[slot], so the shared
+		// buffers stay race-free. All ranges are sub-slices of the existing
+		// per-tensor buffers - no new allocations.
+		mapContiguous(int(n), func(slot, lo, hi int) {
+			var m float32
+			for _, f := range floats[lo:hi] {
+				if math.IsNaN(float64(f)) || math.IsInf(float64(f), 0) {
+					continue
+				}
+				a := f
+				if a < 0 {
+					a = -a
+				}
+				if a > m {
+					m = a
+				}
 			}
-			a := f
-			if a < 0 {
-				a = -a
-			}
-			if a > maxAbs {
-				maxAbs = a
+			results[slot] = m
+		})
+		for i := 0; i < parallelism(int(n)); i++ {
+			if results[i] > maxAbs {
+				maxAbs = results[i]
 			}
 		}
+		// Join the prefetch before the next scan: a failed read fails the
+		// run here (at this chunk boundary, one chunk later than the
+		// serial path, with the same ReadAt error). Then swap the buffers
+		// so the prefetched chunk becomes the current one.
+		if nextErr != nil {
+			if err := <-nextErr; err != nil {
+				return 0, err
+			}
+			buf, buf2 = buf2, buf
+		}
 		done += n
+		// Progress: this chunk's source bytes are scanned (the pass writes
+		// nothing, so the scan is the chunk's work).
+		if prog != nil {
+			prog.Add(n * int64(elemSize))
+		}
 	}
 	return maxAbs, nil
 }
@@ -854,17 +1175,46 @@ func writeF32Scale(w io.Writer, name string, scale float32) error {
 
 // streamConvertFP8 reads a tensor in bounded chunks, converts each element
 // to fp8, and writes the result to w - never holding more than chunkElems
-// elements in memory regardless of the tensor's total size.
-func streamConvertFP8(r io.ReaderAt, w io.Writer, offset int64, srcDType DType, numElems int64, chunkElems int, e4m3 bool) error {
+// elements in memory regardless of the tensor's total size. The per-chunk
+// encode loop is fanned out across cores (mapContiguous) over disjoint
+// output sub-ranges; the write stays one per chunk. The chunk loop
+// double-buffers the raw input (see streamComputeMaxAbsScale): the first
+// chunk is read synchronously, each later chunk is prefetched into a
+// second chunk-sized buffer while the previous chunk is encoded, so the
+// next chunk's read latency overlaps this chunk's CPU work.
+func streamConvertFP8(r io.ReaderAt, w io.Writer, offset int64, srcDType DType, numElems int64, chunkElems int, e4m3 bool, sc *passScratch, prog *Progress) error {
 	elemSize, err := srcDType.ByteSize()
 	if err != nil {
 		return err
 	}
-	inBuf := make([]byte, chunkElems*elemSize)
-	outBuf := make([]byte, chunkElems)
+	// The per-pass buffers come from the run's passScratch (see
+	// passScratch): allocated once per run, sized to chunkElems, and
+	// reused across tensors - no per-tensor or per-chunk allocation.
+	inBuf := sc.raw1[:chunkElems*elemSize]
+	// inBuf2 is the prefetch (double-buffer) counterpart of inBuf: while
+	// chunk i is being encoded, the next chunk i+1 is read into inBuf2 in
+	// a goroutine. +1 raw chunk buffer over the serial path, bounded by
+	// the chunk (memory rule): both are chunk-sized, never tensor-sized.
+	inBuf2 := sc.raw2[:chunkElems*elemSize]
+	outBuf := sc.out[:chunkElems]
 	// One chunk-sized f32 scratch reused across all chunks (see
 	// streamComputeMaxAbsScale): O(chunk) memory, no per-chunk allocations.
-	fbuf := make([]float32, chunkElems)
+	fbuf := sc.fbuf[:chunkElems]
+
+	// The first chunk has no predecessor to overlap with, so it is read
+	// synchronously; every later chunk arrives via the previous
+	// iteration's prefetch (see below), already in inBuf. A zero-element
+	// tensor issues no read at all (the loop below never runs), matching
+	// the serial path.
+	if numElems > 0 {
+		firstN := int64(chunkElems)
+		if numElems < firstN {
+			firstN = numElems
+		}
+		if _, err := r.ReadAt(inBuf[:firstN*int64(elemSize)], offset); err != nil {
+			return err
+		}
+	}
 
 	var done int64
 	for done < numElems {
@@ -873,23 +1223,58 @@ func streamConvertFP8(r io.ReaderAt, w io.Writer, offset int64, srcDType DType, 
 			n = numElems - done
 		}
 		chunkIn := inBuf[:n*int64(elemSize)]
-		if _, err := r.ReadAt(chunkIn, offset+done*int64(elemSize)); err != nil {
-			return err
+		// Prefetch the next chunk into inBuf2 before this chunk's encode,
+		// so its read latency overlaps this chunk's CPU work. The last
+		// chunk has no successor, so no prefetch is started for it.
+		var nextErr chan error
+		if done+n < numElems {
+			nextN := int64(chunkElems)
+			if rem := numElems - done - n; rem < nextN {
+				nextN = rem
+			}
+			nextOff := offset + (done+n)*int64(elemSize)
+			nextBuf := inBuf2
+			nextErr = make(chan error, 1)
+			go func() {
+				_, e := r.ReadAt(nextBuf[:nextN*int64(elemSize)], nextOff)
+				nextErr <- e
+			}()
 		}
 		floats, err := toFloat32SliceInto(fbuf, chunkIn, srcDType)
 		if err != nil {
 			return err
 		}
 		chunkOut := outBuf[:n]
-		for i, f := range floats {
-			if e4m3 {
-				chunkOut[i] = f32ToF8E4M3(f)
-			} else {
-				chunkOut[i] = f32ToF8E5M2(f)
+		// Fan the encode out over the chunk's disjoint outBuf sub-ranges:
+		// each worker touches only chunkOut[lo:hi]. All ranges are
+		// sub-slices of the existing per-tensor buffers - no new
+		// allocations.
+		mapContiguous(int(n), func(_, lo, hi int) {
+			for i := lo; i < hi; i++ {
+				if e4m3 {
+					chunkOut[i] = f32ToF8E4M3(floats[i])
+				} else {
+					chunkOut[i] = f32ToF8E5M2(floats[i])
+				}
 			}
-		}
+		})
 		if _, err := w.Write(chunkOut); err != nil {
 			return err
+		}
+		// Progress: this chunk's source bytes are converted and handed to
+		// the writer.
+		if prog != nil {
+			prog.Add(n * int64(elemSize))
+		}
+		// Join the prefetch before the next encode: a failed read fails
+		// the run here (at this chunk boundary, one chunk later than the
+		// serial path, with the same ReadAt error). Then swap the buffers
+		// so the prefetched chunk becomes the current one.
+		if nextErr != nil {
+			if err := <-nextErr; err != nil {
+				return err
+			}
+			inBuf, inBuf2 = inBuf2, inBuf
 		}
 		done += n
 	}
@@ -897,17 +1282,45 @@ func streamConvertFP8(r io.ReaderAt, w io.Writer, offset int64, srcDType DType, 
 }
 
 // streamConvertInt8 is streamConvertFP8's counterpart for int8, applying a
-// precomputed per-tensor scale to each chunk.
-func streamConvertInt8(r io.ReaderAt, w io.Writer, offset int64, srcDType DType, numElems int64, chunkElems int, scale float32) error {
+// precomputed per-tensor scale to each chunk (and fanning the per-chunk
+// encode out the same way - see streamConvertFP8). It shares the
+// double-buffered chunk loop of streamConvertFP8: the first chunk is read
+// synchronously, each later chunk is prefetched into a second chunk-sized
+// buffer while the previous chunk is encoded, so the next chunk's read
+// latency overlaps this chunk's CPU work.
+func streamConvertInt8(r io.ReaderAt, w io.Writer, offset int64, srcDType DType, numElems int64, chunkElems int, scale float32, sc *passScratch, prog *Progress) error {
 	elemSize, err := srcDType.ByteSize()
 	if err != nil {
 		return err
 	}
-	inBuf := make([]byte, chunkElems*elemSize)
-	outBuf := make([]byte, chunkElems)
+	// The per-pass buffers come from the run's passScratch (see
+	// passScratch): allocated once per run, sized to chunkElems, and
+	// reused across tensors - no per-tensor or per-chunk allocation.
+	inBuf := sc.raw1[:chunkElems*elemSize]
+	// inBuf2 is the prefetch (double-buffer) counterpart of inBuf: while
+	// chunk i is being encoded, the next chunk i+1 is read into inBuf2 in
+	// a goroutine. +1 raw chunk buffer over the serial path, bounded by
+	// the chunk (memory rule): both are chunk-sized, never tensor-sized.
+	inBuf2 := sc.raw2[:chunkElems*elemSize]
+	outBuf := sc.out[:chunkElems]
 	// One chunk-sized f32 scratch reused across all chunks (see
 	// streamComputeMaxAbsScale): O(chunk) memory, no per-chunk allocations.
-	fbuf := make([]float32, chunkElems)
+	fbuf := sc.fbuf[:chunkElems]
+
+	// The first chunk has no predecessor to overlap with, so it is read
+	// synchronously; every later chunk arrives via the previous
+	// iteration's prefetch (see below), already in inBuf. A zero-element
+	// tensor issues no read at all (the loop below never runs), matching
+	// the serial path.
+	if numElems > 0 {
+		firstN := int64(chunkElems)
+		if numElems < firstN {
+			firstN = numElems
+		}
+		if _, err := r.ReadAt(inBuf[:firstN*int64(elemSize)], offset); err != nil {
+			return err
+		}
+	}
 
 	var done int64
 	for done < numElems {
@@ -916,19 +1329,54 @@ func streamConvertInt8(r io.ReaderAt, w io.Writer, offset int64, srcDType DType,
 			n = numElems - done
 		}
 		chunkIn := inBuf[:n*int64(elemSize)]
-		if _, err := r.ReadAt(chunkIn, offset+done*int64(elemSize)); err != nil {
-			return err
+		// Prefetch the next chunk into inBuf2 before this chunk's encode,
+		// so its read latency overlaps this chunk's CPU work. The last
+		// chunk has no successor, so no prefetch is started for it.
+		var nextErr chan error
+		if done+n < numElems {
+			nextN := int64(chunkElems)
+			if rem := numElems - done - n; rem < nextN {
+				nextN = rem
+			}
+			nextOff := offset + (done+n)*int64(elemSize)
+			nextBuf := inBuf2
+			nextErr = make(chan error, 1)
+			go func() {
+				_, e := r.ReadAt(nextBuf[:nextN*int64(elemSize)], nextOff)
+				nextErr <- e
+			}()
 		}
 		floats, err := toFloat32SliceInto(fbuf, chunkIn, srcDType)
 		if err != nil {
 			return err
 		}
 		chunkOut := outBuf[:n]
-		for i, f := range floats {
-			chunkOut[i] = byte(f32ToInt8(f, scale))
-		}
+		// Fan the encode out over the chunk's disjoint outBuf sub-ranges
+		// (see streamConvertFP8); each worker touches only
+		// chunkOut[lo:hi]. All ranges are sub-slices of the existing
+		// per-tensor buffers - no new allocations.
+		mapContiguous(int(n), func(_, lo, hi int) {
+			for i := lo; i < hi; i++ {
+				chunkOut[i] = byte(f32ToInt8(floats[i], scale))
+			}
+		})
 		if _, err := w.Write(chunkOut); err != nil {
 			return err
+		}
+		// Progress: this chunk's source bytes are converted and handed to
+		// the writer.
+		if prog != nil {
+			prog.Add(n * int64(elemSize))
+		}
+		// Join the prefetch before the next encode: a failed read fails
+		// the run here (at this chunk boundary, one chunk later than the
+		// serial path, with the same ReadAt error). Then swap the buffers
+		// so the prefetched chunk becomes the current one.
+		if nextErr != nil {
+			if err := <-nextErr; err != nil {
+				return err
+			}
+			inBuf, inBuf2 = inBuf2, inBuf
 		}
 		done += n
 	}
@@ -953,8 +1401,22 @@ func toFloat32SliceInto(dst []float32, raw []byte, dtype DType) ([]float32, erro
 	if len(dst) < n {
 		return nil, fmt.Errorf("dst too small: %d float32 slots needed, have %d", n, len(dst))
 	}
-	out := dst[:n]
+	switch dtype {
+	case DTypeF32, DTypeF64, DTypeF16, DTypeBF16:
+	default:
+		return nil, fmt.Errorf("unsupported source float dtype %q", dtype)
+	}
+	return decodeFloat32Into(dst, raw, dtype, n), nil
+}
 
+// decodeFloat32Into decodes the first n elements of raw (each of dtype's
+// element size) into dst[:n] and returns that prefix. It is the
+// error-free core of toFloat32SliceInto: the dtype and the slice sizes
+// are preconditions (toFloat32SliceInto validates them), so a caller
+// that has checked them - the convrot window rotation, whose parallel
+// workers cannot return an error - can call it directly.
+func decodeFloat32Into(dst []float32, raw []byte, dtype DType, n int) []float32 {
+	out := dst[:n]
 	switch dtype {
 	case DTypeF32:
 		for i := 0; i < n; i++ {
@@ -976,10 +1438,23 @@ func toFloat32SliceInto(dst []float32, raw []byte, dtype DType) ([]float32, erro
 			bits := binary.LittleEndian.Uint16(raw[i*2:])
 			out[i] = bf16ToF32(bits)
 		}
-	default:
-		return nil, fmt.Errorf("unsupported source float dtype %q", dtype)
 	}
-	return out, nil
+	return out
+}
+
+// toFloat32Slice decodes raw tensor bytes of the given source dtype into a
+// fresh []float32 for uniform downstream processing. The streaming passes
+// use toFloat32SliceInto with a reused chunk-sized scratch instead; this
+// wrapper remains for one-shot callers (and the tests).
+func toFloat32Slice(raw []byte, dtype DType) ([]float32, error) {
+	size, err := dtype.ByteSize()
+	if err != nil {
+		return nil, err
+	}
+	if size == 0 || len(raw)%size != 0 {
+		return nil, fmt.Errorf("raw byte length %d not a multiple of element size %d", len(raw), size)
+	}
+	return toFloat32SliceInto(make([]float32, len(raw)/size), raw, dtype)
 }
 
 // toFloat32Slice decodes raw tensor bytes of the given source dtype into a

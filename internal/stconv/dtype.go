@@ -49,28 +49,47 @@ import (
 
 // ---------- float16 (IEEE-754 binary16) ----------
 
-func f16ToF32(bits uint16) float32 {
-	sign := bits >> 15
-	exp := (bits >> 10) & 0x1F
-	man := bits & 0x3FF
+// f16ToF32 decodes an f16 bit pattern to float32 by pure bit manipulation.
+// Every f16 value is exactly representable in f32, so the decode is a
+// field remap, not a value conversion:
+//
+//   - sign: bit 15 -> bit 31.
+//   - normal (exp 1..0x1E): unbias the 5-bit exponent (bias 15 -> 127) and
+//     left-shift the 10-bit mantissa into f32's 23-bit fraction field.
+//   - subnormal (exp 0, man != 0): value = man * 2^-24. Left-shift man until
+//     its leading 1 lands at bit 9 (shift = 9 - leadingOnePos =
+//     LeadingZeros16(man) - 6, in [0,9]); the value then reads as
+//     (1 + (m-512)/512) * 2^(-15-shift), i.e. f32 exponent 112-shift and
+//     fraction (m-512) << 14 (the leading 1 becomes f32's implicit bit-22 1).
+//   - +/-Inf, NaN (exp == 0x1F): the all-ones f32 exponent
+//     (0x7F800000) plus the f16 mantissa carried into the top ten bits of
+//     f32's fraction field (man << 13) - nonzero for NaN, which is what
+//     distinguishes it from Inf.
+//   - +/-0 (exp == 0, man == 0): the sign bit alone.
+//
+// No float math anywhere: f16->f32 is exact, so the decode is a remap.
+func f16ToF32(h uint16) float32 {
+	sign := uint32(h>>15) << 31
+	exp := uint32(h>>10) & 0x1F
+	man := h & 0x3FF
 
-	var val float64
+	var u uint32
 	switch {
 	case exp == 0x1F:
-		if man == 0 {
-			val = math.Inf(1)
-		} else {
-			val = math.NaN()
-		}
+		// +/-Inf (man == 0) or NaN (man != 0); see the doc comment.
+		u = sign | 0x7F800000 | uint32(man)<<13
 	case exp == 0:
-		val = float64(man) / 1024 * math.Pow(2, -14)
+		if man == 0 {
+			u = sign // +/-0
+		} else {
+			shift := bits.LeadingZeros16(man) - 6 // 0..9
+			m := uint32(man) << uint(shift)
+			u = sign | uint32(112-shift)<<23 | (m-512)<<14
+		}
 	default:
-		val = (1 + float64(man)/1024) * math.Pow(2, float64(exp)-15)
+		u = sign | (exp+112)<<23 | uint32(man)<<13
 	}
-	if sign == 1 {
-		val = -val
-	}
-	return float32(val)
+	return math.Float32frombits(u)
 }
 
 // ---------- bfloat16 ----------
@@ -88,49 +107,71 @@ func bf16ToF32(bits uint16) float32 {
 // used only for NVFP4 block scales. NaN and +/-Inf encode to the 0x7F
 // NaN pattern; magnitudes beyond 448 encode to 0x7F as well (e4m3fn has
 // no Inf), and tiny magnitudes flush to zero.
+//
+// Pure bit manipulation, no Frexp/Round/Pow: the magnitude is read as the
+// 24-bit significand M (leading 1 explicit) and unbiased exponent e,
+// af = M * 2^(e-23), and the encoding is a fixed-point shift-and-round of
+// M's bits:
+//
+//   - normal (biasedExp = e+7 >= 1): the 3 mantissa bits are the top
+//     fraction bits, man>>20; the dropped low 20 bits round
+//     half-away-from-zero - up if dropped*2 >= 2^20 - and a carry (mantissa
+//     8) propagates into the exponent. biasedExp > 15, or biasedExp == 15
+//     with mantissa 7 (the reserved NaN pattern), saturates to 0x7F.
+//   - subnormal (biasedExp < 1): the value in units of the smallest
+//     subnormal step 2^-9 is af/2^-9 = M/2^(14-e) - a right shift of M by
+//     14-e with the same half-away round on the dropped bits. e <= -11
+//     leaves it below half a step, which flushes to zero.
+//
+// f32 subnormals (max magnitude (2^23-1)*2^-149) are far below half an
+// e4m3 subnormal step (2^-10), so they flush to zero as well.
 func f32ToF8E4M3(f float32) uint8 {
-	sign := uint8(0)
-	if math.Signbit(float64(f)) {
-		sign = 0x80
-	}
-	af := math.Abs(float64(f))
+	u := math.Float32bits(f)
+	sign := uint8(u>>31) << 7
+	ef := (u >> 23) & 0xFF
+	man := u & 0x7FFFFF
 
-	if math.IsNaN(float64(f)) {
+	switch {
+	case ef == 0xFF:
+		// NaN (man != 0) and +/-Inf (man == 0) both encode to the 0x7F
+		// pattern: e4m3fn has no Inf, and that pattern is its NaN.
 		return sign | 0x7F
-	}
-	if math.IsInf(float64(f), 0) {
-		return sign | 0x7F // no Inf; saturate into the NaN pattern
-	}
-	if af == 0 {
+	case ef == 0:
+		// +/-0 (man == 0) and f32 subnormals (man != 0) - the latter are
+		// below half the smallest e4m3 subnormal step - both encode to
+		// the sign bit alone (see doc comment).
 		return sign
 	}
 
-	const manBits = 3
-	const denom = 1 << manBits // 8
-	const bias = 7
-
-	frac, exp := math.Frexp(af)
-	m := frac * 2
-	e := int32(exp) - 1
-	biasedExp := e + bias
+	e := int(ef) - 127
+	biasedExp := e + 7
 
 	if biasedExp < 1 {
-		// Subnormal range; smallest normal is 2^(1-bias) = 2^-6.
-		val := af / math.Pow(2, 1-bias) * denom
-		man := int32(math.Round(val))
-		if man <= 0 {
-			return sign
+		// Subnormal range; smallest normal is 2^(1-7) = 2^-6, step 2^-9.
+		// d = 14-e is the shift taking M to units of 2^-9; e <= -7, so
+		// d >= 21.
+		d := 14 - e
+		if d >= 25 {
+			return sign // value < half a subnormal step: flush to zero
 		}
-		if man >= denom {
-			return sign | (1 << manBits) // rounds up into smallest normal
+		M := man | 0x800000
+		q := M >> uint(d)
+		if M-(q<<uint(d)) >= 1<<uint(d-1) {
+			q++ // half-away-from-zero on the dropped bits
 		}
-		return sign | uint8(man)
+		if q >= 8 {
+			return sign | 8 // rounds up into the smallest normal
+		}
+		return sign | uint8(q)
 	}
 
-	manF := math.Round((m - 1) * denom)
-	if manF >= denom {
+	manF := man >> 20 // top 3 bits of the 23-bit fraction
+	if (man&0xFFFFF)*2 >= 1<<20 {
+		manF++ // half-away-from-zero on the dropped low 20 bits
+	}
+	if manF >= 8 {
 		manF = 0
-		biasedExp++
+		biasedExp++ // carry into the exponent
 	}
 	const maxExp = 0xF // 4 exponent bits, all-ones is usable except mantissa==7
 	if biasedExp > maxExp {
@@ -142,7 +183,7 @@ func f32ToF8E4M3(f float32) uint8 {
 		// This exact bit pattern is reserved for NaN.
 		return sign | 0x7F
 	}
-	return sign | uint8(biasedExp)<<manBits | uint8(manF)
+	return sign | uint8(biasedExp)<<3 | uint8(manF)
 }
 
 // rneRound rounds a non-negative float64 to the nearest integer using
@@ -259,53 +300,83 @@ func f8E4M3ToF32(bits uint8) float32 {
 
 // ---------- float8_e5m2 ----------
 
+// f32ToF8E5M2 encodes f to e5m2 with round-half-away-from-zero mantissa
+// rounding (deliberate; pinned by golden tests). Same layout as PyTorch's
+// torch.float8_e5m2 and ONNX's Float8E5M2. NaN encodes to the NaN pattern
+// (0x7F); +/-Inf encode to the Inf pattern (0x7C) - e5m2 represents
+// infinity, so it is kept, not clamped; magnitudes beyond 57344 encode to
+// +/-Inf as well, and tiny magnitudes flush to zero.
+//
+// Pure bit manipulation, no Frexp/Round/Pow: the magnitude is read as the
+// 24-bit significand M (leading 1 explicit) and unbiased exponent e,
+// af = M * 2^(e-23), and the encoding is a fixed-point shift-and-round of
+// M's bits:
+//
+//   - normal (biasedExp = e+15 >= 1): the 2 mantissa bits are the top
+//     fraction bits, man>>21; the dropped low 21 bits round
+//     half-away-from-zero - up if dropped*2 >= 2^21 - and a carry
+//     (mantissa 4) propagates into the exponent. biasedExp >= 31
+//     saturates to +/-Inf.
+//   - subnormal (biasedExp < 1): the value in units of the smallest
+//     subnormal step 2^-16 is af/2^-16 = M/2^(7-e) - a right shift of M by
+//     7-e with the same half-away round on the dropped bits. e <= -18
+//     leaves it below half a step, which flushes to zero.
+//
+// f32 subnormals (max magnitude (2^23-1)*2^-149) are far below half an
+// e5m2 subnormal step (2^-17), so they flush to zero as well.
 func f32ToF8E5M2(f float32) uint8 {
-	sign := uint8(0)
-	if math.Signbit(float64(f)) {
-		sign = 0x80
-	}
-	af := math.Abs(float64(f))
+	u := math.Float32bits(f)
+	sign := uint8(u>>31) << 7
+	ef := (u >> 23) & 0xFF
+	man := u & 0x7FFFFF
 
-	if math.IsNaN(float64(f)) {
-		return sign | 0x7F // exp=11111, man=11 -> NaN
-	}
-	if math.IsInf(float64(f), 0) {
-		return sign | 0x7C // exp=11111, man=00 -> Inf
-	}
-	if af == 0 {
+	switch {
+	case ef == 0xFF:
+		if man == 0 {
+			return sign | 0x7C // +/-Inf: e5m2 represents infinity
+		}
+		return sign | 0x7F // NaN
+	case ef == 0:
+		// +/-0 (man == 0) and f32 subnormals (man != 0) - the latter are
+		// below half the smallest e5m2 subnormal step - both encode to
+		// the sign bit alone (see doc comment).
 		return sign
 	}
 
-	const manBits = 2
-	const denom = 1 << manBits // 4
-	const bias = 15
-
-	frac, exp := math.Frexp(af)
-	m := frac * 2
-	e := int32(exp) - 1
-	biasedExp := e + bias
+	e := int(ef) - 127
+	biasedExp := e + 15
 
 	if biasedExp < 1 {
-		val := af / math.Pow(2, 1-bias) * denom
-		man := int32(math.Round(val))
-		if man <= 0 {
-			return sign
+		// Subnormal range; smallest normal is 2^(1-15) = 2^-14, step 2^-16.
+		// d = 7-e is the shift taking M to units of 2^-16; e <= -15, so
+		// d >= 22.
+		d := 7 - e
+		if d >= 25 {
+			return sign // value < half a subnormal step: flush to zero
 		}
-		if man >= denom {
-			return sign | (1 << manBits)
+		M := man | 0x800000
+		q := M >> uint(d)
+		if M-(q<<uint(d)) >= 1<<uint(d-1) {
+			q++ // half-away-from-zero on the dropped bits
 		}
-		return sign | uint8(man)
+		if q >= 4 {
+			return sign | 4 // rounds up into the smallest normal
+		}
+		return sign | uint8(q)
 	}
 
-	manF := math.Round((m - 1) * denom)
-	if manF >= denom {
+	manF := man >> 21 // top 2 bits of the 23-bit fraction
+	if (man&0x1FFFFF)*2 >= 1<<21 {
+		manF++ // half-away-from-zero on the dropped low 21 bits
+	}
+	if manF >= 4 {
 		manF = 0
-		biasedExp++
+		biasedExp++ // carry into the exponent
 	}
 	if biasedExp >= 0x1F {
 		return sign | 0x7C // overflow -> Inf
 	}
-	return sign | uint8(biasedExp)<<manBits | uint8(manF)
+	return sign | uint8(biasedExp)<<2 | uint8(manF)
 }
 
 func f8E5M2ToF32(bits uint8) float32 {
@@ -349,6 +420,13 @@ func int8Scale(maxAbs float32) float32 {
 // are float comparisons that are false for NaN, and int8(NaN) is
 // implementation-defined per the Go spec), +Inf -> 127, -Inf -> -127,
 // scale == 0 -> 0.
+//
+// S4 note: an f32-only rewrite (one f32 divide, magnitude clamps and the
+// sign read from the f32 bits, no float64, no math.Round) was prototyped
+// and is byte-identical to this version (see f32ToInt8Ref and
+// TestInt8Int4QuantizeOracle), but on this machine it measured ~2.1x
+// slower than the float64 path in the S1 microbenchmark, so the float64
+// implementation is kept.
 func f32ToInt8(f, scale float32) int8 {
 	if math.IsNaN(float64(f)) {
 		return 0
@@ -382,57 +460,66 @@ func int4Scale(maxAbs float32) float32 {
 }
 
 // f32ToInt4RNE quantizes the f32 quotient f/scale to the nearest int4 value
-// in [-7,7], using true round-to-nearest-even (RNE). It is deliberately
-// distinct from f32ToInt8's math.Round (half-away-from-zero): a quotient of
-// exactly 2.5 rounds to 2 here, not 3. The quotient v = f/scale is f32-
-// rounded once, exactly like the int8 path, then its magnitude is rounded:
-//
-//	q := int32(|v|); frac := |v| - float64(q)
-//	frac > 0.5            -> q+1
-//	frac == 0.5 && q odd  -> q+1
+// in [-7,7], using true round-to-nearest-even (RNE), as exact bit
+// manipulation - one f32 divide, the magnitude clamp and the RNE rounding
+// on v's f32 bits, no float64 promotion. It is deliberately distinct from
+// f32ToInt8's half-away-from-zero: a quotient of exactly 2.5 rounds to 2
+// here, not 3. For |v| < 8 the RNE tests reduce to exact integer compares
+// on v's 24-bit significand - the same rounding the pre-S4 float64 version
+// performed, bit for bit.
 //
 // Edge behavior: NaN -> 0, +Inf -> 7, -Inf -> -7, scale == 0 -> 0, and
 // magnitudes >= 7.5 clamp to 7 - clamped in float space before the integer
 // conversion, so out-of-int32-range quotients clamp too instead of
 // overflowing.
 func f32ToInt4RNE(f, scale float32) int8 {
-	if scale == 0 {
+	if math.Float32bits(scale)&0x7FFFFFFF == 0 { // scale == 0 (incl. -0)
 		return 0
 	}
-	if math.IsNaN(float64(f)) {
+	u := math.Float32bits(f)
+	if u&0x7FFFFFFF > 0x7F800000 { // NaN
 		return 0
 	}
-	if math.IsInf(float64(f), 0) {
-		if math.Signbit(float64(f)) {
+	if u&0x7FFFFFFF == 0x7F800000 { // +/-Inf
+		if u&0x80000000 != 0 {
 			return -7
 		}
 		return 7
 	}
 	v := f / scale
-	av := math.Abs(float64(v))
-	// Clamp in float space before int32(av): the conversion is
-	// implementation-defined once av exceeds the int32 range, and the
-	// post-conversion q > 7 clamp below would never see the overflow.
-	// av < 8 keeps the int32 path in range; the q > 7 clamp still handles
-	// the 7.5 -> 8 RNE tie. Mirrors f32ToInt8's float-space clamping.
-	if !(av < 8) {
-		if math.Signbit(float64(f)) {
+	a := math.Float32bits(v) & 0x7FFFFFFF
+	// Clamp in float space before any integer conversion: |v| >= 8 (or a
+	// NaN v from a NaN scale, or +/-Inf from a division overflow) rounds
+	// to 8 or more, so it saturates to the int4 bound either way - the
+	// same values the pre-S4 float-space clamp produced.
+	if a >= 0x41000000 || a > 0x7F800000 {
+		if u&0x80000000 != 0 {
 			return -7
 		}
 		return 7
 	}
-	q := int32(av)
-	frac := av - float64(q)
-	switch {
-	case frac > 0.5:
-		q++
-	case frac == 0.5 && q%2 == 1:
-		q++
+	// |v| < 8: RNE on v's bits in integer space. The magnitude's exponent
+	// is e in {0, 126, 127, 128, 129}; v = M' * 2^(e-150) with M' the
+	// 24-bit significand. For e >= 127 the integer part is the top
+	// 150-e bits of M' and the fraction the rest, so the RNE tests are
+	// exact integer compares - the same rounding the pre-S4 float64
+	// version performed, bit for bit.
+	var q int32
+	if a >= 0x3F800000 { // |v| >= 1 (e in {127, 128, 129})
+		M := a&0x7FFFFF | 0x800000 // 24-bit significand
+		s := 150 - int(a>>23)      // in {23, 22, 21}
+		q = int32(M >> uint(s))
+		frac := M & (1<<s - 1)
+		if frac*2 > 1<<s || (frac*2 == 1<<s && q%2 == 1) {
+			q++ // fraction > 0.5, or exactly 0.5 with odd integer part
+		}
+		if q > 7 {
+			q = 7 // the 7.5 -> 8 RNE tie
+		}
+	} else if a > 0x3F000000 { // 0.5 < |v| < 1 -> 1; |v| <= 0.5 -> 0 (the
+		q = 1 // 0.5 tie goes to the even integer 0)
 	}
-	if q > 7 {
-		q = 7
-	}
-	if math.Signbit(float64(f)) {
+	if u&0x80000000 != 0 {
 		q = -q
 	}
 	return int8(q)

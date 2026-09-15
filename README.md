@@ -226,10 +226,44 @@ whole tensor - let alone a whole file - into memory:
   grow with tensor size); the only things that survive are bounded scalars
   and fixed-size group buffers (256/32/16 elements). Peak memory stays
   `O(chunk)`.
+- **Pass buffers are allocated once per run, sized only by the chunk.**
+  Every pass's working buffers live in a single per-run scratch shared by
+  all tensors (tensors are processed strictly one at a time): the
+  double-buffered raw input (the current chunk plus the prefetched next
+  one - the +1 prefetch buffer, which also overlaps each chunk's disk read
+  with the previous chunk's compute), the f32 decode buffer, the
+  encode/pack output buffers, the mxfp4/nvfp4 scale and packed buffers, and
+  the convrot window's group buffers (one 256-element f32 buffer per
+  rotation group in the window). The total is
+  `passScratchSize(chunkElems)` - `O(chunk) x small constant`, ~26.6MB at
+  the default `2^20` chunk - plus a few per-worker scratch slices bounded
+  by the CPU count. Memory stays `O(chunk)`, independent of tensor count,
+  tensor size, and file size.
 
-Measured on a synthetic 1GB single-tensor file, peak RSS was ~27MB and
-did not increase between a 200MB and a 1GB input - confirming memory use
-is decoupled from file size in practice, not just in theory.
+Measured on the bundled regression models with the default chunk, peak RSS
+was 24-27MB on the 1.7GB single-file model and 36-44MB on the 9.3GB
+two-shard model - within the documented bound (the pass scratch plus the
+Go runtime) on both, and decoupled from file size in practice, not just in
+theory: a 5.5x larger file raises the peak by at most ~1.6x, and the
+difference between the two models is multi-shard bookkeeping and runtime
+noise, not buffer growth.
+
+## Progress output
+
+While a run is in flight, the tool writes a live progress line to
+**stderr** (the per-tensor report on stdout stays pipeable as-is):
+
+```
+[  12/488] model.layers.11.mlp.down_proj.weight  47%  812.3MB/s  eta 3.2s
+```
+
+It shows which tensor of the run is being converted, how far along that
+tensor is, and the run's rate and ETA. The line is redrawn in place
+(carriage return, no newline) and throttled to at most ~10 live updates
+per second; each tensor leaves one final line (100%, newline) when it
+finishes. Zero-element tensors show `done` instead of a percentage.
+`-quiet` disables the progress output together with the per-tensor
+report. A run that fails mid-tensor simply stops updating the line.
 
 ## Regression testing with the bundled model inputs
 
@@ -349,9 +383,17 @@ runs, and watch peak RSS stay flat (see Memory behavior above).
 - `internal/stconv/convert.go` - orchestrates reading tensors, deciding a
   target per tensor, converting, and building the output file (single
   merged file, or per-shard files plus index).
+- `internal/stconv/fanout.go` - the parallel fan-out primitives
+  (mapContiguous / mapStrided) the streaming passes use to parallelize
+  work within a chunk; the worker count is bounded by the CPU count, so
+  memory stays O(chunk).
 - `internal/stconv/quant.go` - the streaming conversion passes for the four
   new targets (int4, int8_convrot, mxfp4, nvfp4), including the 256-element
   Hadamard rotation; each pass is chunked and bounded per the memory rules.
+- `internal/stconv/progress.go` - the live progress reporter: one
+  `[i/N] name  pct  rate  eta` line on the writer (stderr in the CLI),
+  redrawn in place and throttled to at most one live update per 100ms,
+  with an injectable clock so tests can drive time deterministically.
 - `testdata/gen/gen.go` - standalone generator for small synthetic
   `.safetensors` fixtures for manual end-to-end tests: `single` writes
   one 3-tensor file, `multi` writes a 2-shard model directory with an
@@ -385,10 +427,12 @@ runs, and watch peak RSS stay flat (see Memory behavior above).
   next step. Note this would also mean per-channel max-abs scanning
   during the streaming pass, which is a straightforward extension of the
   existing chunked scan.
-- No CUDA/SIMD - this processes weights on CPU, tensor by tensor, single
-  threaded. Fine for offline conversion; not built for serving-time
-  speed. Tensor-level conversion is embarrassingly parallel if throughput
-  ever matters more than simplicity (each tensor's plan is independent).
+- No CUDA/SIMD assembly - conversion is CPU-only, but CPU-parallel within
+  each streaming pass (the per-chunk work fans out across cores, worker
+  count bounded by the CPU count, no extra memory - see Memory behavior);
+  still no GPU and no hand-written SIMD, per the standard-library-only and
+  minimalism rules. Fine for offline conversion; not built for serving-time
+  speed.
 - int8_convrot uses plain `max/127` row scales - the guide's `--mseclip`
   clip-boundary optimization is not implemented (a natural next step).
   The rotation group size is fixed at 256 (no flag), and groups are flat
