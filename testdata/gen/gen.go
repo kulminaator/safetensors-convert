@@ -10,6 +10,7 @@
 //	go run ./testdata/gen multirot <outDir>   // 2-shard model dir with 256-elem tensors
 //	go run ./testdata/gen qwenlike <outFile>  // one BF16 file named like a small Qwen model
 //	go run ./testdata/gen empty <outFile>     // one BF16 file with zero-element tensors
+//	go run ./testdata/gen odd <outFile>       // one BF16 file of odd/zero-shape tensors
 //
 // Tensor values are fixed below so tests can spot-check converted output
 // against known inputs.
@@ -346,6 +347,23 @@ func writeQwenLike(outPath string) {
 	}, false)
 }
 
+// writeOdd writes a single BF16 file of small tensors whose shapes
+// stress the packed 4-bit owner shape rule end to end: an odd last
+// dimension [32,1], all-odd dimensions [3,3], a 1-D odd length [5], an
+// even control [2,128], and a zero-element [0,8]. The names deliberately
+// avoid the default protection policy's patterns, so every tensor
+// converts. It is the fixture for the spec-invariant e2e test of the
+// packed owner shapes.
+func writeOdd(outPath string) {
+	writeSafetensors(outPath, []fixtureTensor{
+		qwenLikeTensor("w.a", "[32,1]", 32),
+		qwenLikeTensor("w.b", "[3,3]", 9),
+		qwenLikeTensor("w.c", "[5]", 5),
+		qwenLikeTensor("w.d", "[2,128]", 256),
+		{name: "w.e", dtype: "BF16", shape: "[0,8]", data: nil},
+	}, false)
+}
+
 // writeMultiRot writes a 2-shard model directory whose tensors are
 // 256-element multiples (for the ConvRot e2e tests): shard 1 holds
 // rot.a (BF16 [128,2], rotation groups straddle rows), shard 2 holds
@@ -439,7 +457,7 @@ func writeIndex(path string, shards []shard, totalSize int) {
 
 func main() {
 	if len(os.Args) != 3 {
-		fmt.Fprintln(os.Stderr, "usage: gen single <outFile> | gen multi <outDir> | gen single256 <outFile> | gen multirot <outDir> | gen qwenlike <outFile> | gen empty <outFile>")
+		fmt.Fprintln(os.Stderr, "usage: gen single <outFile> | gen multi <outDir> | gen single256 <outFile> | gen multirot <outDir> | gen qwenlike <outFile> | gen empty <outFile> | gen odd <outFile>")
 		os.Exit(1)
 	}
 	switch os.Args[1] {
@@ -455,6 +473,8 @@ func main() {
 		writeQwenLike(os.Args[2])
 	case "empty":
 		writeEmpty(os.Args[2])
+	case "odd":
+		writeOdd(os.Args[2])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown mode %q\n", os.Args[1])
 		os.Exit(1)

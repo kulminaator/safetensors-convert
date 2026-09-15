@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -225,6 +226,80 @@ func TestPlanShardOutput(t *testing.T) {
 			// index's basename.
 			if want := filepath.Join(outDir, fixtureIndexName); outIdx.Path != want {
 				t.Errorf("output index path = %q, want %q", outIdx.Path, want)
+			}
+		})
+	}
+}
+
+// TestPlanShardOutputPackedTargets pins the spec byte-count invariant in
+// every output shard header for the packed 4-bit targets - the
+// shardout.go emission site's counterpart of TestConvertOddPackedTargets
+// (which covers the merged-file site). Every converted tensor in the
+// multi fixture carries packed U8 data, so its shard header must store
+// the packed (halved) shape; the I32 buffer passes through unchanged.
+func TestPlanShardOutputPackedTargets(t *testing.T) {
+	inIdx, err := LoadIndex(filepath.Join(fixtureDir, fixtureIndexName))
+	if err != nil {
+		t.Fatalf("LoadIndex: %v", err)
+	}
+	for _, tc := range []struct {
+		name   string
+		target TargetKind
+	}{
+		{"mxfp4", TargetMxFP4},
+		{"nvfp4", TargetNVFP4},
+		{"int4", TargetInt4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plans, _, err := planModel(ConvertOptions{
+				InputShards: multiShardPaths(),
+				Default:     tc.target,
+			})
+			if err != nil {
+				t.Fatalf("planModel: %v", err)
+			}
+			shards, _, err := PlanShardOutput(plans, inIdx, t.TempDir())
+			if err != nil {
+				t.Fatalf("PlanShardOutput: %v", err)
+			}
+			if len(shards) != 2 {
+				t.Fatalf("got %d shards, want 2", len(shards))
+			}
+			for _, sh := range shards {
+				// The spec byte-count invariant in every output shard
+				// header - the exact check the official loader enforces.
+				checkSpecInvariant(t, sh.Header)
+				checkContiguous(t, sh.Header)
+			}
+			// Packed owners carry the halved shape in their shard header
+			// ([2,4] -> [2,2], [2,2] -> [2,1], [4] -> [2]); the I32
+			// buffer keeps [4]; sibling shapes are unchanged (all block
+			// scales here are 1-element, so scalar []).
+			wantShape := map[string][]int64{
+				nameUpProj:                   {2, 2},
+				nameQProj:                    {2, 1},
+				nameNorm:                     {2},
+				namePosIDs:                   {4},
+				nameUpProj + ".scale":        {},
+				nameQProj + ".scale":         {},
+				nameNorm + ".scale":          {},
+				nameUpProj + ".block_scale":  {},
+				nameQProj + ".block_scale":   {},
+				nameNorm + ".block_scale":    {},
+				nameUpProj + ".global_scale": {},
+				nameQProj + ".global_scale":  {},
+				nameNorm + ".global_scale":   {},
+			}
+			for _, sh := range shards {
+				for _, e := range sh.Header.Tensors {
+					want, ok := wantShape[e.Name]
+					if !ok {
+						t.Fatalf("shard %s: unexpected tensor %s", sh.Name, e.Name)
+					}
+					if !slices.Equal(e.Info.Shape, want) {
+						t.Errorf("shard %s: tensor %s shape = %v, want %v", sh.Name, e.Name, e.Info.Shape, want)
+					}
+				}
 			}
 		})
 	}

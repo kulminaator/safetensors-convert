@@ -344,7 +344,17 @@ runs, and watch peak RSS stay flat (see Memory behavior above).
   `.global_scale` (nvfp4). Scalar-scale siblings follow their owner in the
   file; vector-scale siblings (convrot row scales, mxfp4/nvfp4 block
   scales) precede it - in the file and in the output index's `weight_map`
-  order.
+  order. Packed 4-bit owner tensors (int4, mxfp4, nvfp4) carry the
+  **packed** shape in the header, not the pre-packing element shape: the
+  last dimension is halved when it is even (the usual case), else the
+  nearest even dimension scanning backwards is halved (e.g. `[32,1] ->
+  [16,1]`), else the shape is 1-D `[ceil(elems/2)]` (e.g. `[3,3] -> [5]`);
+  zero-element tensors keep their shape. This keeps the spec's byte-count
+  invariant `prod(shape) == packed byte count`, so standard loaders
+  (`safetensors`, transformers, vLLM) can open the files. Unpacking the
+  nibbles (low nibble = element `2i`) is a loader-side convention, and the
+  packed byte stream is flat row-major - the packed-shape fix is
+  header-only: the data bytes are unchanged.
 - Non-float tensors (int/bool weights, buffers, etc.) are always copied
   through unchanged - quantizing already-integer tensors is out of scope.
 - Tensor order and any `__metadata__` block from the input header are
@@ -409,9 +419,12 @@ runs, and watch peak RSS stay flat (see Memory behavior above).
   is a zero-element [0,8] tensor, a 256-element tensor (a ConvRot
   rotation group), a zero-element [0] tensor, and a 16-element tensor
   (not a 256-multiple) - the fixture for the zero-element convrot
-  regression test. The generated fixtures are committed under
-  `testdata/single`, `testdata/multi`, `testdata/single256`,
-  `testdata/multirot`, `testdata/qwenlike`, and `testdata/empty`.
+  regression test, and `odd` writes one BF16 file of small odd/zero-
+  shape tensors ([32,1], [3,3], [5], [2,128], [0,8]) - the fixture for
+  the packed-owner-shape spec-invariant e2e test. The generated fixtures
+  are committed under `testdata/single`, `testdata/multi`,
+  `testdata/single256`, `testdata/multirot`, `testdata/qwenlike`,
+  `testdata/empty`, and `testdata/odd`.
 
 ## Known limitations / next steps
 

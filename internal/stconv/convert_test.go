@@ -93,6 +93,30 @@ func checkOutHeader(t *testing.T, h *Header, want []outEntry) {
 	}
 }
 
+// checkSpecInvariant asserts the safetensors spec byte-count invariant
+// for every tensor in h: the data_offsets span equals prod(shape) ×
+// itemsize(dtype). It is the exact check the official loader enforces
+// when parsing a header; the pre-fix packed 4-bit owners violated it
+// (full pre-packing element shape with only (numElems+1)/2 bytes).
+func checkSpecInvariant(t *testing.T, h *Header) {
+	t.Helper()
+	for _, e := range h.Tensors {
+		span := e.Info.DataOffsets[1] - e.Info.DataOffsets[0]
+		var prod int64 = 1
+		for _, d := range e.Info.Shape {
+			prod *= d
+		}
+		item, err := e.Info.DType.ByteSize()
+		if err != nil {
+			t.Fatalf("tensor %s: unknown dtype %s", e.Name, e.Info.DType)
+		}
+		if want := prod * int64(item); span != want {
+			t.Errorf("tensor %s: data span %d, want prod(shape %v) x itemsize(%s) = %d",
+				e.Name, span, e.Info.Shape, e.Info.DType, want)
+		}
+	}
+}
+
 func TestPlanModelTwoShards(t *testing.T) {
 	plans, outHeader, err := planModel(ConvertOptions{
 		InputShards: multiShardPaths(),
@@ -921,6 +945,148 @@ func TestConvertEmptyTensorsOtherTargets(t *testing.T) {
 	}
 }
 
+// oddFixturePath is the committed 1-file gen fixture (testdata/gen's odd
+// mode): five BF16 tensors - w.a [32,1] (odd last dim), w.b [3,3] (all
+// odd), w.c [5] (1-D odd), w.d [2,128] (even control), w.e [0,8]
+// (zero-element). The names avoid the default protection policy, so
+// every tensor converts.
+const oddFixturePath = "../../testdata/odd/odd.safetensors"
+
+// TestConvertOddPackedTargets is the spec-invariant regression test for
+// the packed 4-bit owner header shapes (int4/mxfp4/nvfp4): it converts
+// the odd fixture to each target and asserts, for every tensor in the
+// output header, the safetensors spec invariant data span ==
+// prod(shape) × itemsize(dtype) - the exact check the official loader
+// enforces. It fails on the pre-fix code, which wrote the full
+// pre-packing element shape into the owner header while storing only
+// (numElems+1)/2 bytes.
+func TestConvertOddPackedTargets(t *testing.T) {
+	cases := []struct {
+		name   string
+		target TargetKind
+		header []outEntry
+		shape  map[string][]int64 // every output tensor name -> exact header shape
+	}{
+		{
+			"int4", TargetInt4,
+			[]outEntry{
+				{"w.a", DTypeU8, [2]int64{0, 16}},
+				{"w.a.scale", DTypeF32, [2]int64{16, 20}},
+				{"w.b", DTypeU8, [2]int64{20, 25}},
+				{"w.b.scale", DTypeF32, [2]int64{25, 29}},
+				{"w.c", DTypeU8, [2]int64{29, 32}},
+				{"w.c.scale", DTypeF32, [2]int64{32, 36}},
+				{"w.d", DTypeU8, [2]int64{36, 164}},
+				{"w.d.scale", DTypeF32, [2]int64{164, 168}},
+				{"w.e", DTypeU8, [2]int64{168, 168}},
+				{"w.e.scale", DTypeF32, [2]int64{168, 172}},
+			},
+			map[string][]int64{
+				"w.a": {16, 1}, "w.a.scale": {},
+				"w.b": {5}, "w.b.scale": {},
+				"w.c": {3}, "w.c.scale": {},
+				"w.d": {2, 64}, "w.d.scale": {},
+				"w.e": {0, 8}, "w.e.scale": {},
+			},
+		},
+		{
+			"mxfp4", TargetMxFP4,
+			[]outEntry{
+				{"w.a.block_scale", DTypeU8, [2]int64{0, 1}},
+				{"w.a", DTypeU8, [2]int64{1, 17}},
+				{"w.b.block_scale", DTypeU8, [2]int64{17, 18}},
+				{"w.b", DTypeU8, [2]int64{18, 23}},
+				{"w.c.block_scale", DTypeU8, [2]int64{23, 24}},
+				{"w.c", DTypeU8, [2]int64{24, 27}},
+				{"w.d.block_scale", DTypeU8, [2]int64{27, 35}},
+				{"w.d", DTypeU8, [2]int64{35, 163}},
+				{"w.e.block_scale", DTypeU8, [2]int64{163, 163}},
+				{"w.e", DTypeU8, [2]int64{163, 163}},
+			},
+			map[string][]int64{
+				"w.a.block_scale": {}, "w.a": {16, 1}, // ceil(32/32)=1 -> scalar
+				"w.b.block_scale": {}, "w.b": {5}, // ceil(9/32)=1  -> scalar
+				"w.c.block_scale": {}, "w.c": {3}, // ceil(5/32)=1  -> scalar
+				"w.d.block_scale": {8}, "w.d": {2, 64},
+				"w.e.block_scale": {0}, "w.e": {0, 8},
+			},
+		},
+		{
+			"nvfp4", TargetNVFP4,
+			[]outEntry{
+				{"w.a.global_scale", DTypeF32, [2]int64{0, 4}},
+				{"w.a.block_scale", DTypeF8E4M3, [2]int64{4, 6}},
+				{"w.a", DTypeU8, [2]int64{6, 22}},
+				{"w.b.global_scale", DTypeF32, [2]int64{22, 26}},
+				{"w.b.block_scale", DTypeF8E4M3, [2]int64{26, 27}},
+				{"w.b", DTypeU8, [2]int64{27, 32}},
+				{"w.c.global_scale", DTypeF32, [2]int64{32, 36}},
+				{"w.c.block_scale", DTypeF8E4M3, [2]int64{36, 37}},
+				{"w.c", DTypeU8, [2]int64{37, 40}},
+				{"w.d.global_scale", DTypeF32, [2]int64{40, 44}},
+				{"w.d.block_scale", DTypeF8E4M3, [2]int64{44, 60}},
+				{"w.d", DTypeU8, [2]int64{60, 188}},
+				{"w.e.global_scale", DTypeF32, [2]int64{188, 192}},
+				{"w.e.block_scale", DTypeF8E4M3, [2]int64{192, 192}},
+				{"w.e", DTypeU8, [2]int64{192, 192}},
+			},
+			map[string][]int64{
+				"w.a.global_scale": {}, "w.a.block_scale": {2}, "w.a": {16, 1},
+				"w.b.global_scale": {}, "w.b.block_scale": {}, "w.b": {5}, // ceil(9/16)=1 -> scalar
+				"w.c.global_scale": {}, "w.c.block_scale": {}, "w.c": {3}, // ceil(5/16)=1 -> scalar
+				"w.d.global_scale": {}, "w.d.block_scale": {16}, "w.d": {2, 64},
+				"w.e.global_scale": {}, "w.e.block_scale": {0}, "w.e": {0, 8},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := filepath.Join(t.TempDir(), "out.safetensors")
+			if _, err := ConvertFile(ConvertOptions{
+				InputPath:  oddFixturePath,
+				OutputPath: out,
+				Default:    tc.target,
+				Protect:    true,
+			}); err != nil {
+				t.Fatalf("ConvertFile: %v", err)
+			}
+			f, err := os.Open(out)
+			if err != nil {
+				t.Fatalf("opening output: %v", err)
+			}
+			defer f.Close()
+			outHeader, _, err := ReadHeader(f)
+			if err != nil {
+				t.Fatalf("reading output header: %v", err)
+			}
+
+			// Full header pin: order, dtype, offsets.
+			checkOutHeader(t, outHeader, tc.header)
+			// The spec byte-count invariant for every tensor - the exact
+			// check the official loader enforces; it fails on the
+			// pre-fix packed owners (full element shape, half the bytes).
+			checkSpecInvariant(t, outHeader)
+			checkContiguous(t, outHeader)
+			// Exact header shapes: packed owners carry the halved/ceil
+			// shape, siblings keep the unchanged shapes (scalar scales
+			// and 1-element block scales are 0-D [], longer block
+			// scales are [n]).
+			if len(outHeader.Tensors) != len(tc.shape) {
+				t.Fatalf("output header has %d tensors, want %d", len(outHeader.Tensors), len(tc.shape))
+			}
+			for _, e := range outHeader.Tensors {
+				want, ok := tc.shape[e.Name]
+				if !ok {
+					t.Fatalf("unexpected output tensor %s", e.Name)
+				}
+				if !slices.Equal(e.Info.Shape, want) {
+					t.Errorf("tensor %s shape = %v, want %v", e.Name, e.Info.Shape, want)
+				}
+			}
+		})
+	}
+}
+
 // TestConvertModelProgress pins the progress wiring end to end: a run of
 // the 3-tensor single fixture with a Progress on a buffer renders the
 // [i/3] index for every tensor, all three tensor names, and ends with a
@@ -1578,6 +1744,48 @@ func TestPlanSiblings(t *testing.T) {
 	}
 }
 
+// TestPackedOwnerShape pins every branch of the packed 4-bit owner shape
+// rule (zero-element, 0-D, even last dim, backwards even scan, all-odd
+// 1-D ceil form) and the byte-count invariant prod(result) ==
+// (numElems+1)/2.
+func TestPackedOwnerShape(t *testing.T) {
+	cases := []struct {
+		shape    []int64
+		numElems int64
+		want     []int64
+	}{
+		{[]int64{2, 128}, 256, []int64{2, 64}},
+		{[]int64{1024, 3584}, 1024 * 3584, []int64{1024, 1792}},
+		{[]int64{32, 1}, 32, []int64{16, 1}}, // A_log: odd last dim
+		{[]int64{3, 3}, 9, []int64{5}},       // all odd -> 1-D ceil(9/2)
+		{[]int64{5}, 5, []int64{3}},          // 1-D odd
+		{[]int64{16}, 16, []int64{8}},        // 1-D even
+		{[]int64{0, 8}, 0, []int64{0, 8}},    // zero-element keeps shape
+		{[]int64{0}, 0, []int64{0}},
+		{nil, 1, []int64{1}}, // 0-D (1 element) -> [1]
+		{[]int64{2, 3, 4}, 24, []int64{2, 3, 2}},
+		{[]int64{3, 2, 1}, 6, []int64{3, 1, 1}},
+	}
+	for _, tc := range cases {
+		in := append([]int64(nil), tc.shape...) // fresh copy: input must not be mutated
+		got := packedOwnerShape(in, tc.numElems)
+		if !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("packedOwnerShape(%v, %d) = %#v, want %#v", tc.shape, tc.numElems, got, tc.want)
+			continue
+		}
+		var prod int64 = 1
+		for _, d := range got {
+			prod *= d
+		}
+		if want := (tc.numElems + 1) / 2; prod != want {
+			t.Errorf("packedOwnerShape(%v, %d) = %#v: prod = %d, want (numElems+1)/2 = %d", tc.shape, tc.numElems, got, prod, want)
+		}
+		if !reflect.DeepEqual(in, tc.shape) {
+			t.Errorf("packedOwnerShape(%v, %d) mutated its input: now %#v", tc.shape, tc.numElems, in)
+		}
+	}
+}
+
 // planTensorFor plans one synthetic tensor against a given target and
 // returns the plan plus the fresh header it emitted into.
 func planTensorFor(t *testing.T, target TargetKind, shape []int64) (tensorPlan, *Header) {
@@ -1602,8 +1810,9 @@ func TestPlanTensorNewTargetHeaders(t *testing.T) {
 	shape := []int64{2, 128} // 256 elements
 
 	cases := []struct {
-		target TargetKind
-		want   []outEntry
+		target     TargetKind
+		want       []outEntry
+		ownerShape []int64 // header shape of the owner tensor "w"
 	}{
 		{
 			TargetInt4,
@@ -1611,6 +1820,7 @@ func TestPlanTensorNewTargetHeaders(t *testing.T) {
 				{"w", DTypeU8, [2]int64{0, 128}},          // 256 elems -> 128 packed bytes
 				{"w.scale", DTypeF32, [2]int64{128, 132}}, // scalar F32 after owner
 			},
+			[]int64{2, 64}, // packed: last dim halved
 		},
 		{
 			TargetInt8ConvRot,
@@ -1618,6 +1828,7 @@ func TestPlanTensorNewTargetHeaders(t *testing.T) {
 				{"w.scale", DTypeF32, [2]int64{0, 8}}, // 2 row scales, before owner
 				{"w", DTypeI8, [2]int64{8, 264}},      // 256 I8 bytes
 			},
+			[]int64{2, 128}, // 1 byte/elem: source shape kept
 		},
 		{
 			TargetMxFP4,
@@ -1625,6 +1836,7 @@ func TestPlanTensorNewTargetHeaders(t *testing.T) {
 				{"w.block_scale", DTypeU8, [2]int64{0, 8}}, // 256/32 = 8 E8M0 bytes, before owner
 				{"w", DTypeU8, [2]int64{8, 136}},           // 128 packed bytes
 			},
+			[]int64{2, 64}, // packed: last dim halved
 		},
 		{
 			TargetNVFP4,
@@ -1633,6 +1845,7 @@ func TestPlanTensorNewTargetHeaders(t *testing.T) {
 				{"w.block_scale", DTypeF8E4M3, [2]int64{4, 20}}, // 256/16 = 16 bytes
 				{"w", DTypeU8, [2]int64{20, 148}},               // 128 packed bytes
 			},
+			[]int64{2, 64}, // packed: last dim halved
 		},
 	}
 	for _, tc := range cases {
@@ -1641,6 +1854,18 @@ func TestPlanTensorNewTargetHeaders(t *testing.T) {
 			t.Fatalf("%v: unexpected skip %q", tc.target, p.skippedWhy)
 		}
 		checkOutHeader(t, h, tc.want)
+		// The owner's header shape: packed 4-bit targets carry the halved
+		// shape (spec byte-count invariant), 1-byte/elem targets keep the
+		// source shape.
+		var owner TensorEntry
+		for _, e := range h.Tensors {
+			if e.Name == "w" {
+				owner = e
+			}
+		}
+		if !slices.Equal(owner.Info.Shape, tc.ownerShape) {
+			t.Errorf("%v: owner shape = %v, want %v", tc.target, owner.Info.Shape, tc.ownerShape)
+		}
 	}
 }
 

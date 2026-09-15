@@ -103,7 +103,7 @@ func PlanShardOutput(plans []tensorPlan, inIndex *Index, outDir string) ([]Shard
 					total += s.byteLen()
 				}
 			}
-			appendHeaderEntry(sh.Header, p.name, p.outDType, p.srcInfo.Shape, p.outLen)
+			appendHeaderEntry(sh.Header, p.name, p.outDType, p.outShape, p.outLen)
 			total += p.outLen
 			sh.WeightMap[p.name] = shardName
 			outIndex.WeightMap[p.name] = shardName

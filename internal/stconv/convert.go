@@ -70,11 +70,12 @@ type tensorPlan struct {
 	numElems        int64
 	target          TargetKind
 	outDType        DType
-	outLen          int64  // planned output byte length of this tensor (sibling tensors not included)
-	protectReason   string // non-empty => the passthrough came from the default protection policy, not from config/default or a mechanical constraint
-	protectOverride bool   // explicit config rule converted a tensor the policy would protect; surfaced in TensorStat for the CLI warning
-	skippedWhy      string // non-empty => passthrough copy, no conversion
-	sibs            []sib  // sibling tensors this plan emits (nil for passthrough)
+	outShape        []int64 // output header shape (packed/halved for the 4-bit packed targets, source shape otherwise)
+	outLen          int64   // planned output byte length of this tensor (sibling tensors not included)
+	protectReason   string  // non-empty => the passthrough came from the default protection policy, not from config/default or a mechanical constraint
+	protectOverride bool    // explicit config rule converted a tensor the policy would protect; surfaced in TensorStat for the CLI warning
+	skippedWhy      string  // non-empty => passthrough copy, no conversion
+	sibs            []sib   // sibling tensors this plan emits (nil for passthrough)
 }
 
 // sib is one sibling tensor emitted alongside a converted tensor's owner.
@@ -148,6 +149,43 @@ func planSiblings(target TargetKind, shape []int64, numElems int64) []sib {
 		}
 	}
 	return nil
+}
+
+// packedOwnerShape returns the header shape for a packed 4-bit owner
+// tensor (int4/mxfp4/nvfp4) whose data stores 2 elements per U8 byte:
+// prod(result) == (numElems+1)/2, the spec byte-count invariant.
+//
+// The rule is GPTQ/AWQ-style: a zero-element tensor keeps its shape
+// (prod = 0 = packed byte count); a 0-D tensor (1 element) becomes [1];
+// otherwise the last dimension is halved when it is even (the usual
+// case, where packing is contiguous along the last dim), else the
+// nearest even dimension scanning backwards is halved (e.g. [32,1] ->
+// [16,1]); if every dimension is odd the element count is odd, so the
+// result is the 1-D ceil form [(numElems+1)/2] (e.g. [3,3] -> [5]).
+// The packed byte stream is identical regardless of which dimension is
+// halved - packing is flat row-major, low nibble = element 2i - so only
+// the header shape label changes and the rule only needs to satisfy the
+// byte-count invariant.
+func packedOwnerShape(shape []int64, numElems int64) []int64 {
+	out := make([]int64, len(shape))
+	copy(out, shape)
+	if numElems == 0 {
+		return out
+	}
+	if len(shape) == 0 {
+		return []int64{1}
+	}
+	if shape[len(shape)-1]%2 == 0 {
+		out[len(shape)-1] /= 2
+		return out
+	}
+	for i := len(shape) - 2; i >= 0; i-- {
+		if shape[i]%2 == 0 {
+			out[i] /= 2
+			return out
+		}
+	}
+	return []int64{(numElems + 1) / 2}
 }
 
 // ConvertFile reads a single safetensors file, converts tensors according
@@ -531,6 +569,7 @@ func planTensor(opts ConvertOptions, name string, info TensorInfo, srcShard int,
 		srcAbsOffset: dataStart + info.DataOffsets[0],
 		srcLen:       info.DataOffsets[1] - info.DataOffsets[0],
 		numElems:     numElems,
+		outShape:     info.Shape,
 	}
 	if plan.srcLen < 0 {
 		return plan, fmt.Errorf("tensor %q: invalid data_offsets %v", name, info.DataOffsets)
@@ -629,6 +668,7 @@ func planTensor(opts ConvertOptions, name string, info TensorInfo, srcShard int,
 		case TargetInt4, TargetMxFP4, TargetNVFP4:
 			plan.outDType = DTypeU8
 			plan.outLen = (numElems + 1) / 2 // 2 elements packed per byte
+			plan.outShape = packedOwnerShape(info.Shape, numElems)
 		default:
 			return plan, fmt.Errorf("tensor %q: unhandled target kind %v", name, target)
 		}
@@ -637,18 +677,20 @@ func planTensor(opts ConvertOptions, name string, info TensorInfo, srcShard int,
 
 	// Passthrough plans copy exactly the source's stored bytes (srcLen),
 	// the same length copyRaw writes. For ordinary tensors srcLen ==
-	// dtype-size × numElems; for this tool's own packed 4-bit outputs the
-	// header keeps the full semantic shape while only half the bytes are
-	// stored, so srcLen is what keeps the re-emitted data_offsets
-	// consistent with the data actually written (a -target none round-trip
-	// of such an output stays byte-identical).
+	// dtype-size × numElems, and this tool's own packed 4-bit outputs
+	// satisfy the same agreement now that their header carries the
+	// packed shape (see packedOwnerShape): srcLen == numElems ×
+	// itemsize, so a -target none round-trip of such an output stays
+	// byte-identical.
 	//
 	// That is exactly why the shape/offset byte-agreement check above
 	// (srcLen == numElems × srcElemSize) is converting-path-only and is
-	// NOT applied here: a passthrough must not be rejected for the
-	// packed-4-bit case, where srcLen is deliberately half of
-	// numElems × srcElemSize. Such a tensor's dtype is U8, which is
-	// non-convertible anyway, so it always lands on this path.
+	// NOT applied here: a passthrough must not be rejected for third-
+	// party files written with a lenient packed convention, where the
+	// header keeps the full semantic shape while only half the bytes are
+	// stored, so srcLen is deliberately half of numElems × srcElemSize.
+	// Such a tensor's dtype is U8, which is non-convertible anyway, so it
+	// always lands on this path.
 	if plan.skippedWhy != "" {
 		plan.outLen = plan.srcLen
 	}
@@ -659,7 +701,7 @@ func planTensor(opts ConvertOptions, name string, info TensorInfo, srcShard int,
 			appendHeaderEntry(outHeader, name+s.suffix, s.dtype, sibShape(s), s.byteLen())
 		}
 	}
-	appendHeaderEntry(outHeader, name, plan.outDType, info.Shape, plan.outLen)
+	appendHeaderEntry(outHeader, name, plan.outDType, plan.outShape, plan.outLen)
 	for _, s := range plan.sibs {
 		if !s.before {
 			appendHeaderEntry(outHeader, name+s.suffix, s.dtype, sibShape(s), s.byteLen())
